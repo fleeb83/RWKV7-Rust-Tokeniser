@@ -1,0 +1,13 @@
+RWKV7 Rust Tokeniser
+
+Bundled file: vocab/rwkv_vocab_v20230424.txt
+Source: BlinkDL/ChatRWKV
+Revision: 2e2bb1cd390cefbedae0a89f4a343f6f754d6621
+URL: https://github.com/BlinkDL/ChatRWKV/blob/2e2bb1cd390cefbedae0a89f4a343f6f754d6621/tokenizer/rwkv_vocab_v20230424.txt
+SHA-256: e6dee3d4e31b4d5c40ac99508ac6c701ceef4bed681bf2167ce9a908552bca89
+The vocabulary is redistributed unmodified under Apache-2.0.
+Upstream license: https://github.com/BlinkDL/ChatRWKV/blob/2e2bb1cd390cefbedae0a89f4a343f6f754d6621/LICENSE
+A copy of the Apache-2.0 license is included in LICENSE.
+
+Packaging changes on 2026-09-05 add a bundled-vocabulary constructor and test;
+the matching algorithm is unchanged.

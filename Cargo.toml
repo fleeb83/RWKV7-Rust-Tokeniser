@@ -1,0 +1,13 @@
+[package]
+name = "rwkv-tokenizer"
+version = "0.1.0"
+edition = "2021"
+description = "RWKV World tokeniser: greedy trie matcher, pure Rust, zero dependencies"
+license = "Apache-2.0"
+repository = "https://github.com/fleeb83/RWKV7-Rust-Tokeniser"
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = "1"
+sha2 = "0.10"

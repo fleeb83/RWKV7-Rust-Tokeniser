@@ -1,0 +1,3 @@
+* text=auto eol=lf
+# Preserve exact upstream vocabulary bytes and SHA-256.
+/vocab/rwkv_vocab_v20230424.txt -text
