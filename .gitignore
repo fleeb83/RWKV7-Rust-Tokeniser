@@ -22,3 +22,6 @@ Thumbs.db
 *.pth
 *.pt
 *.gguf
+
+# Local version backups
+/backups/
