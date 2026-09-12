@@ -393,8 +393,22 @@ impl RwkvTokenizer {
 
     /// Zero/one workers stay sequential. Larger requests share the global pool.
     pub fn encode_with_policy(&self, src: &[u8], workers: usize, min_bytes: usize) -> Result<Vec<u32>, EncodeError> {
-        let workers = workers.min(cooperate::worker_limit()).min(src.len());
-        if src.is_empty() || src.len() < min_bytes || workers <= 1 { return self.encode_sequential_bytes(src); }
+        self.encode_with_policy_report(src, workers, min_bytes).map(|(tokens, _)| tokens)
+    }
+
+    /// Encode and report the effective matching job count from this call.
+    /// One means sequential (including empty input); larger counts mean the
+    /// parallel matching path. Jobs share the pool and CPU budget, so this is
+    /// not a measurement of simultaneous OS threads.
+    pub fn encode_with_policy_report(&self, src: &[u8], workers: usize, min_bytes: usize) -> Result<(Vec<u32>, usize), EncodeError> {
+        self.encode_with_worker_limit(src, workers, min_bytes, cooperate::worker_limit())
+    }
+
+    fn encode_with_worker_limit(&self, src: &[u8], workers: usize, min_bytes: usize, worker_limit: usize) -> Result<(Vec<u32>, usize), EncodeError> {
+        let workers = workers.min(worker_limit).min(src.len());
+        if src.is_empty() || src.len() < min_bytes || workers <= 1 {
+            return self.encode_sequential_bytes(src).map(|tokens| (tokens, 1));
+        }
         let input = Arc::new(Self::copy_input(src));
         let chunk = src.len().div_ceil(workers);
         let (sender, receiver) = mpsc::channel();
@@ -434,7 +448,7 @@ impl RwkvTokenizer {
             }
             permit.finish(i - start);
         }
-        Ok(result)
+        Ok((result, src.len().div_ceil(chunk)))
     }
 
     pub fn encode_parallel(&self, src: &[u8]) -> Result<Vec<u32>, EncodeError> {
@@ -689,7 +703,7 @@ mod tests {
         let mut input = vec![b'a'; PARALLEL_MIN_BYTES];
         input.push(b'c');
         assert_eq!(
-            tokenizer.encode_parallel_with_workers(&input, 2),
+            tokenizer.encode_with_worker_limit(&input, 2, PARALLEL_MIN_BYTES, 2),
             Err(EncodeError {
                 byte_offset: PARALLEL_MIN_BYTES,
                 byte: b'c'
@@ -726,8 +740,28 @@ mod tests {
         let mut input = Vec::with_capacity(PARALLEL_MIN_BYTES + seed.len());
         while input.len() < PARALLEL_MIN_BYTES { input.extend_from_slice(seed); }
         let sequential = tokenizer.encode_sequential(&input).unwrap();
-        let parallel = tokenizer.encode_parallel_with_workers(&input, 2).unwrap();
+        // Exercise matching jobs on one-worker hosts without changing the CPU gate.
+        let before = cooperation_stats();
+        let (parallel, workers) = tokenizer.encode_with_worker_limit(&input, 2, PARALLEL_MIN_BYTES, 2).unwrap();
+        let after = cooperation_stats();
+        assert_eq!(workers, 2);
+        assert!(after.submitted_jobs + after.inline_fallbacks >= before.submitted_jobs + before.inline_fallbacks + 2);
         assert_eq!(sequential, parallel);
+    }
+    #[test]
+    fn effective_policy_reports_caps_thresholds_and_job_count() {
+        let tokenizer = RwkvTokenizer::from_vocab_str_partial("1 b'a' 1\n").unwrap();
+        for (len, requested, threshold, cap, expected) in [
+            (0, 8, 0, 8, 1), (1, 8, 0, 8, 1),
+            (10, 0, 0, 8, 1), (10, 1, 0, 8, 1),
+            (10, 8, 11, 8, 1), (10, 8, 10, 1, 1),
+            (10, 8, 10, 2, 2), (10, 8, 10, 8, 5),
+        ] {
+            let input = vec![b'a'; len];
+            let (tokens, workers) = tokenizer.encode_with_worker_limit(&input, requested, threshold, cap).unwrap();
+            assert_eq!(workers, expected);
+            assert_eq!(tokens, vec![1; len]);
+        }
     }
     #[test]
     fn direct_transitions_cover_vocabulary_and_reject_foreign_edges() {
