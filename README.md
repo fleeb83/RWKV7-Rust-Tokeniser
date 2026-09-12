@@ -125,6 +125,18 @@ For a vocabulary file of your own, use
 `RwkvTokenizer::from_file(std::path::Path::new("path/to/vocab.txt"))`.
 It must follow the supported RWKV World format and token ordering.
 
+## Longest-match selection
+
+Version **0.2.1** pins the greedy matcher's longest-match rule with tests.
+Before 0.2.1 the matcher used "higher token ID" as a proxy for "longer token",
+which is wrong for a custom vocabulary that numbers a longer token below its
+own prefix: with `1 b'abc' 3 / 2 b'ab' 2 / 3 b'a' 1 / 4 b'b' 1 / 5 b'c' 1`,
+`encode("abc")` returned `[2, 5]` instead of `[1]`. The matcher now takes the
+deepest terminal it reaches regardless of ID. The bundled
+`rwkv_vocab_v20230424.txt` never triggered the old behaviour -- all 65,529
+entries order every prefix below its extensions -- and a test now checks that
+by machine, so bundled-vocabulary output is unchanged.
+
 ## Sharing the CPU
 
 Version **0.2.0** adds a cooperative CPU budget shared by independent tokenizer

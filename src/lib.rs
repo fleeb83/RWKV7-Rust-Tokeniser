@@ -581,6 +581,54 @@ mod tests {
         assert!(tokenizer.decode_bytes(&[RESERVED_TOKEN_ID]).is_err());
     }
 
+    #[test]
+    fn reviewer_counterexample_prefers_the_longest_token() {
+        // Reported counterexample: 'abc' has a LOWER ID than its prefix 'ab',
+        // so the old higher-ID proxy for "longest match" returned [2, 5].
+        let tokenizer = RwkvTokenizer::from_vocab_str_partial(
+            "1 b'abc' 3
+2 b'ab' 2
+3 b'a' 1
+4 b'b' 1
+5 b'c' 1
+",
+        )
+        .unwrap();
+        assert_eq!(tokenizer.encode_bytes(b"abc").unwrap(), vec![1]);
+        assert_eq!(tokenizer.encode_bytes(b"ab").unwrap(), vec![2]);
+        assert_eq!(tokenizer.encode_bytes(b"abx"), Err(EncodeError { byte_offset: 2, byte: b'x' }));
+    }
+
+    // The old higher-ID proxy was valid on the SHIPPED vocabulary and only wrong
+    // for custom ones. That is a property of this file, so check it by machine
+    // rather than asserting it in prose: no token may have a shorter prefix
+    // token with a higher ID.
+    #[test]
+    fn bundled_vocabulary_never_gives_a_shorter_prefix_a_higher_id() {
+        let text = include_str!("../vocab/rwkv_vocab_v20230424.txt");
+        let mut tokens = Vec::new();
+        for line in text.lines() {
+            let first = line.find(' ').unwrap();
+            let last = line.rfind(' ').unwrap();
+            tokens.push((
+                line[..first].parse::<u32>().unwrap(),
+                parse_python_literal(&line[first + 1..last]).unwrap(),
+            ));
+        }
+        assert_eq!(tokens.len(), 65_529);
+        let ids: std::collections::HashMap<&[u8], u32> =
+            tokens.iter().map(|(id, bytes)| (bytes.as_slice(), *id)).collect();
+        let mut violations = Vec::new();
+        for (id, bytes) in &tokens {
+            for len in 1..bytes.len() {
+                if let Some(prefix_id) = ids.get(&bytes[..len]) {
+                    if prefix_id > id { violations.push((*prefix_id, *id)); }
+                }
+            }
+        }
+        assert_eq!(violations, Vec::<(u32, u32)>::new());
+    }
+
     fn literal(bytes: &[u8]) -> String {
         let mut result = String::from("b'");
         for byte in bytes { result.push_str(&format!("\\x{byte:02x}")); }
