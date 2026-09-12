@@ -341,7 +341,8 @@ impl RwkvTokenizer {
                     if next == 0 || next as u8 != byte { break; }
                     state = next;
                     let id = (state >> 8) as u16;
-                    if id as u32 > best.0 { best = (id as u32,(offset+3) as u8); }
+                    // Every later terminal is a longer match, regardless of ID.
+                    if id != 0 { best = (id as u32,(offset+3) as u8); }
                     if state >> 32 == 0 { break; }
                 }
             }
@@ -610,7 +611,7 @@ mod tests {
             let last = line.rfind(' ').unwrap();
             tokens.push((line[..first].parse::<u32>().unwrap(), parse_python_literal(&line[first + 1..last]).unwrap()));
         }
-        tokens.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
+        tokens.sort_by_key(|(_, bytes)| std::cmp::Reverse(bytes.len()));
         let mut single = [None; 256];
         let mut buckets = vec![Vec::new(); 256 * 256];
         for (id, bytes) in tokens {
@@ -717,8 +718,8 @@ mod tests {
         for id in 1..=256u32 {
             text.push_str(&format!("{id} {} 1\n", literal(&[(id - 1) as u8])));
         }
-        // The shorter pair has the higher ID, so it wins even when the
-        // longer triple also matches. The second triple exercises a group
+        // The shorter pair has the higher ID, but the longer triple wins.
+        // The second triple exercises a group
         // with no pair candidate.
         text.push_str(&format!("300 {} 3\n", literal(b"xyz")));
         text.push_str(&format!("301 {} 2\n", literal(b"xy")));
@@ -730,7 +731,28 @@ mod tests {
             tokenizer.encode_bytes(input).unwrap(),
             reference_encode(&reference, input)
         );
-        assert_eq!(tokenizer.encode_bytes(input).unwrap(), vec![301, 123, 302]);
+        assert_eq!(tokenizer.encode_bytes(input).unwrap(), vec![300, 302]);
+    }
+
+    #[test]
+    fn longest_match_ignores_ids_across_encoding_paths() {
+        // Deeper terminals have smaller IDs; abcd is a nonterminal prefix.
+        let tokenizer = RwkvTokenizer::from_vocab_str_partial(
+            "1 b'abcde' 5\n2 b'abc' 3\n3 b'ab' 2\n4 b'a' 1\n"
+        ).unwrap();
+        for (input, expected) in [(b"abcdeabcaba".as_slice(), vec![1, 2, 3, 4]), (b"abc", vec![2])] {
+            assert_eq!(tokenizer.encode_bytes(input).unwrap(), expected);
+            let (parallel, workers) = tokenizer.encode_with_worker_limit(input, 2, 0, 2).unwrap();
+            assert_eq!(workers, 2);
+            assert_eq!(parallel, expected);
+            assert_eq!(tokenizer.decode_bytes(&expected).unwrap(), input);
+        }
+        for count in [1, 2, 6, 32] {
+            assert_eq!(tokenizer.encode_batch(&vec!["abcdeabcaba"; count], 2).unwrap(), vec![vec![1, 2, 3, 4]; count]);
+        }
+        let missing = Err(EncodeError { byte_offset: 3, byte: b'd' });
+        assert_eq!(tokenizer.encode_bytes(b"abcdx"), missing);
+        assert_eq!(tokenizer.encode_with_worker_limit(b"abcdx", 2, 0, 2).map(|(tokens, _)| tokens), missing);
     }
 
     #[test]
@@ -872,27 +894,25 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_degree_boundaries_preserve_priority_and_missing_offsets() {
+    fn hybrid_degree_boundaries_preserve_longest_match_and_missing_offsets() {
         for count in [15u32,16,256] {
-            for shorter_wins in [false,true] {
+            for shorter_has_higher_id in [false,true] {
                 let mut vocab=String::new();
                 for byte in 0..256u32 { vocab.push_str(&format!("{} {} 1\n",byte+1,literal(&[byte as u8]))); }
-                if !shorter_wins { vocab.push_str("299 b'ab' 2\n"); }
+                if !shorter_has_higher_id { vocab.push_str("299 b'ab' 2\n"); }
                 let mut partial=String::new();
-                if !shorter_wins { partial.push_str("299 b'ab' 2\n"); }
+                if !shorter_has_higher_id { partial.push_str("299 b'ab' 2\n"); }
                 for byte in 0..count {
                     let line=format!("{} {} 3\n",300+byte,literal(&[b'a',b'b',byte as u8]));
                     vocab.push_str(&line);partial.push_str(&line);
                 }
-                if shorter_wins { vocab.push_str("600 b'ab' 2\n");partial.push_str("600 b'ab' 2\n"); }
+                if shorter_has_higher_id { vocab.push_str("600 b'ab' 2\n");partial.push_str("600 b'ab' 2\n"); }
                 let full=RwkvTokenizer::from_vocab_str(&vocab).unwrap();
                 let partial=RwkvTokenizer::from_vocab_str_partial(&partial).unwrap();
                 for byte in 0..count {
                     let input=[b'a',b'b',byte as u8];
-                    assert_eq!(full.encode_sequential(&input).unwrap(),if shorter_wins {vec![600,byte+1]} else {vec![300+byte]});
-                    assert_eq!(partial.encode_sequential(&input),if shorter_wins {
-                        Err(EncodeError { byte_offset:2,byte:byte as u8 })
-                    } else {Ok(vec![300+byte])});
+                    assert_eq!(full.encode_sequential(&input).unwrap(),vec![300+byte]);
+                    assert_eq!(partial.encode_sequential(&input),Ok(vec![300+byte]));
                 }
                 if count<256 {
                     let input=[b'a',b'b',255];
