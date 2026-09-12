@@ -291,11 +291,10 @@ fn encode_case(
                 format!("case_id {:?} encode failed: {error}", case.case_id)
             }),
         Mode::Parallel => {
-            let fallback = input.len() < PARALLEL_MIN_BYTES;
             tokenizer
-                .encode_parallel_with_workers(input, workers)
-                .map(|tokens| {
-                    if fallback {
+                .encode_with_policy_report(input, workers, PARALLEL_MIN_BYTES)
+                .map(|(tokens, workers)| {
+                    if workers == 1 {
                         (tokens, "sequential-fallback", 1)
                     } else {
                         (tokens, "parallel", workers)
@@ -661,6 +660,29 @@ mod tests {
             ("parallel", "17"),
         ] {
             assert!(parse_args(args(mode, workers)).is_err(), "{mode} {workers}");
+        }
+    }
+
+    #[test]
+    fn manifest_reports_effective_parallel_policy() {
+        let tokenizer = RwkvTokenizer::from_vocab_str_partial("1 b'a' 1\n").unwrap();
+        for len in [0, PARALLEL_MIN_BYTES - 1, PARALLEL_MIN_BYTES] {
+            let case = Case {
+                case_id: format!("policy-{len}"), text: "a".repeat(len), seed: 1,
+                expected_tokens: vec![1; len], expected_bytes: vec![b'a'; len],
+            };
+            let config = Config {
+                vocab: PathBuf::new(), fixture: PathBuf::new(), output: PathBuf::new(),
+                mode: Mode::Parallel, workers: MAX_WORKERS, iterations: 1,
+            };
+            let outcome = verify_case(&tokenizer, &case, &config).unwrap();
+            let cap = rwkv_tokenizer::cooperation_stats().worker_limit;
+            let expected = if len < PARALLEL_MIN_BYTES || cap <= 1 { 1 } else {
+                len.div_ceil(len.div_ceil(MAX_WORKERS.min(cap)))
+            };
+            assert_eq!(outcome["actual_workers"], expected);
+            assert_eq!(outcome["actual_path"], if expected == 1 { "sequential-fallback" } else { "parallel" });
+            assert_eq!(outcome["fallback"], expected == 1);
         }
     }
 
