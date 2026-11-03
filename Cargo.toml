@@ -1,7 +1,8 @@
 [package]
 name = "rwkv-tokenizer"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
+rust-version = "1.81"
 description = "RWKV World tokeniser: greedy trie matcher, pure Rust, zero dependencies"
 license = "Apache-2.0"
 repository = "https://github.com/fleeb83/RWKV7-Rust-Tokeniser"
@@ -11,3 +12,27 @@ repository = "https://github.com/fleeb83/RWKV7-Rust-Tokeniser"
 [dev-dependencies]
 serde_json = "1"
 sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+redundant_lifetimes = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"
+ptr_as_ptr = "warn"
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+large_stack_arrays = "warn"
+cloned_instead_of_copied = "warn"
+inefficient_to_string = "warn"

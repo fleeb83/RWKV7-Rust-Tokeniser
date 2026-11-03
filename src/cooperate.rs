@@ -4,6 +4,7 @@
 //! process. It deliberately measures CPU capacity, not external system load:
 //! the standard library has no portable load signal.
 
+use std::cell::Cell;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc::{self, Receiver, SyncSender},
@@ -20,18 +21,31 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_INTERVAL: Duration = Duration::from_millis(250);
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// Snapshot of process-wide cooperation counters; counters are cumulative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Stats {
+    /// Logical CPUs reported by the OS.
     pub detected_cpus: usize,
+    /// Current cap on simultaneously active work quanta.
     pub worker_limit: usize,
+    /// Quanta running right now.
     pub active: usize,
+    /// Highest `active` seen so far.
     pub peak_active: usize,
+    /// Work quanta finished, including skipped tiny calls credited to a sampled call.
     pub completed_quanta: usize,
+    /// Times a caller waited for a free slot or rest period.
     pub waits: usize,
+    /// Times a finishing quantum yielded its thread.
     pub yields: usize,
+    /// Rest periods started to limit sustained CPU use.
     pub cooldowns: usize,
+    /// Threads in the shared matching pool.
     pub pool_threads: usize,
+    /// Matching jobs handed to the pool.
     pub submitted_jobs: usize,
+    /// Jobs run on the caller's thread because the pool was unavailable or full.
     pub inline_fallbacks: usize,
 }
 
@@ -145,14 +159,15 @@ fn cooldown_delay(detected_cpus: usize, waiting: usize, elapsed: Duration) -> Op
 // permits later work instead of requesting another sub-millisecond sleep.
 fn remaining_rest(state: &mut GateState, now: Instant) -> Option<Duration> {
     let started = state.rest_started?;
-    let elapsed = now.saturating_duration_since(started).as_nanos().min(i128::MAX as u128) as i128;
+    let elapsed = now.saturating_duration_since(started).as_nanos();
+    let elapsed = i128::try_from(elapsed).unwrap_or(i128::MAX);
     if elapsed >= state.rest_debt_ns {
         // ponytail: credit at most 20 ms; long idle periods must not remove future cooperation.
         state.rest_debt_ns = state.rest_debt_ns.saturating_sub(elapsed).max(-20_000_000);
         state.rest_started = None;
         None
     } else {
-        Some(Duration::from_nanos((state.rest_debt_ns - elapsed).min(u64::MAX as i128) as u64))
+        Some(Duration::from_nanos(u64::try_from(state.rest_debt_ns - elapsed).unwrap_or(u64::MAX)))
     }
 }
 
@@ -163,7 +178,7 @@ fn account_busy(state: &mut GateState, now: Instant) {
     if state.active > 0 {
         state.busy_since_yield_ns = state.busy_since_yield_ns.saturating_add(elapsed.as_nanos());
         if let Some(delay) = cooldown_delay(state.detected_cpus, state.waiting, elapsed) {
-            state.rest_debt_ns = state.rest_debt_ns.saturating_add(delay.as_nanos().min(i128::MAX as u128) as i128);
+            state.rest_debt_ns = state.rest_debt_ns.saturating_add(i128::try_from(delay.as_nanos()).unwrap_or(i128::MAX));
         }
     }
 }
@@ -202,6 +217,25 @@ pub(crate) fn acquire() -> Permit<'static> {
     acquire_from(gate())
 }
 
+const TINY_BYTES: usize = 256;
+const TINY_SAMPLE: usize = 16; // power of two: sampled when calls & (TINY_SAMPLE - 1) == 0
+thread_local! { static TINY_CALLS: Cell<usize> = const { Cell::new(0) }; }
+
+/// Calls of at most TINY_BYTES finish in about 100 ns, far below the 1 ms
+/// quantum target. Each thread takes the gate on its first and every
+/// TINY_SAMPLE-th such call, crediting the calls it skipped.
+// ponytail: skipped calls bypass the worker cap and busy-time accounting; scale the sampled call's time by its credit if foreground guards regress.
+pub(crate) fn acquire_for(len: usize) -> Permit<'static> {
+    if len > TINY_BYTES { return acquire(); }
+    let calls = TINY_CALLS.with(|calls| { let n = calls.get(); calls.set(n.wrapping_add(1)); n });
+    if calls & (TINY_SAMPLE - 1) != 0 {
+        return Permit { gate: gate(), started: None, finished: true, byte_budget: usize::MAX, credit: 0 };
+    }
+    let mut permit = acquire();
+    permit.credit = if calls == 0 { 0 } else { TINY_SAMPLE - 1 };
+    permit
+}
+
 fn acquire_from<'a>(gate: &'a Gate) -> Permit<'a> {
     let mut state = lock(&gate.state);
     loop {
@@ -212,7 +246,7 @@ fn acquire_from<'a>(gate: &'a Gate) -> Permit<'a> {
         if state.active < state.worker_limit && state.rest_debt_ns <= 0 {
             state.active += 1;
             state.peak_active = state.peak_active.max(state.active);
-            return Permit { gate, started: now, finished: false, byte_budget: state.quantum };
+            return Permit { gate, started: Some(now), finished: false, byte_budget: state.quantum, credit: 0 };
         }
 
         state.waits += 1;
@@ -226,23 +260,27 @@ fn acquire_from<'a>(gate: &'a Gate) -> Permit<'a> {
 
 pub(crate) struct Permit<'a> {
     gate: &'a Gate,
-    started: Instant,
+    /// None for a tiny call that skipped the gate.
+    started: Option<Instant>,
     finished: bool,
     byte_budget: usize,
+    /// Skipped tiny calls this permit reports as completed.
+    credit: usize,
 }
 
 impl<'a> Permit<'a> {
     pub(crate) fn byte_budget(&self) -> usize { self.byte_budget }
 
     pub(crate) fn finish(mut self, bytes: usize) {
+        let Some(started) = self.started else { return };
         self.finished = true;
         let gate = self.gate;
         let mut state = lock(&gate.state);
         let now = Instant::now();
         refresh(&mut state, now);
-        state.completed_quanta = state.completed_quanta.saturating_add(1);
+        state.completed_quanta = state.completed_quanta.saturating_add(1 + self.credit);
         // Tiny partial quanta measure call overhead, not sustained byte throughput.
-        if bytes >= MIN_QUANTUM { state.quantum = next_quantum(state.quantum, bytes, now.saturating_duration_since(self.started)); }
+        if bytes >= MIN_QUANTUM { state.quantum = next_quantum(state.quantum, bytes, now.saturating_duration_since(started)); }
         let yield_now = release_slot(&mut state, now);
         if state.waiting > 0 { gate.changed.notify_one(); }
         drop(state);
@@ -497,8 +535,22 @@ mod tests {
         let up = next_quantum(MIN_QUANTUM, MAX_QUANTUM, Duration::from_micros(10));
         let down = next_quantum(MAX_QUANTUM, MIN_QUANTUM, Duration::from_millis(100));
         assert!(up > MIN_QUANTUM && up <= MAX_QUANTUM);
-        assert!(down < MAX_QUANTUM && down >= MIN_QUANTUM);
+        assert!((MIN_QUANTUM..MAX_QUANTUM).contains(&down));
         assert_eq!(next_quantum(64 * 1024, 0, Duration::ZERO), 64 * 1024);
+    }
+
+    #[test]
+    fn tiny_calls_sample_the_gate_and_credit_skipped_calls() {
+        thread::spawn(|| {
+            for call in 0..33 {
+                let permit = acquire_for(TINY_BYTES);
+                let sampled = call % 16 == 0;
+                assert_eq!(permit.started.is_some(), sampled, "call {call}");
+                assert_eq!(permit.credit, if sampled && call > 0 { 15 } else { 0 }, "call {call}");
+                permit.finish(1);
+            }
+            assert!(acquire_for(TINY_BYTES + 1).started.is_some());
+        }).join().unwrap();
     }
 
     #[test]

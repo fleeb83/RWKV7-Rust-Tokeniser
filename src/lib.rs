@@ -1,6 +1,24 @@
-#![warn(clippy::undocumented_unsafe_blocks)]
+#![forbid(unsafe_code)]
 
-//! Standalone RWKV World tokenizer.
+//! Standalone RWKV World tokenizer: a greedy longest-match trie matcher in pure Rust
+//! with no runtime dependencies.
+//!
+//! [`RwkvTokenizer::bundled`] loads the official `rwkv_vocab_v20230424` vocabulary;
+//! [`RwkvTokenizer::from_vocab_str`] and [`RwkvTokenizer::from_file`] load your own.
+//! Encoding turns text or bytes into token IDs, decoding turns IDs back. Heavy work
+//! shares a process-wide CPU budget, see [`cooperation_stats`].
+//!
+//! ```
+//! use rwkv_tokenizer::RwkvTokenizer;
+//!
+//! let tokenizer = RwkvTokenizer::bundled().expect("valid bundled vocabulary");
+//! let ids = tokenizer.encode("Hello, world!").expect("encodable text");
+//! assert_eq!(tokenizer.decode_utf8(&ids).unwrap(), "Hello, world!");
+//! ```
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 use std::{fmt, path::Path, sync::{Arc, mpsc, atomic::{AtomicUsize, Ordering}}};
 
@@ -9,17 +27,25 @@ pub use cooperate::Stats as CooperationStats;
 /// Process-wide activity for this crate. Peaks and counters are cumulative.
 pub fn cooperation_stats() -> CooperationStats { cooperate::stats() }
 
+/// Number of token IDs (0..65536); ID 0 is reserved.
 pub const VOCAB_SIZE: usize = 65_536;
+const _: () = assert!(VOCAB_SIZE == 1 << 16, "token IDs are stored as u16");
+/// Token ID 0 has no text; treat it as end-of-text.
 pub const RESERVED_TOKEN_ID: u32 = 0;
+/// Input length below which parallel encoding stays sequential by default.
 pub const PARALLEL_MIN_BYTES: usize = 1 << 17;
-pub const PARALLEL_MAX_WORKERS: usize = 8;
-pub const BATCH_MIN_BYTES: usize = 1 << 16;
-pub const BATCH_BYTES_PER_WORKER: usize = 1 << 15;
+/// Total batch size below which `encode_batch_auto` stays sequential.
+const BATCH_MIN_BYTES: usize = 1 << 16;
+/// Batch bytes per worker chosen by `encode_batch_auto`.
+const BATCH_BYTES_PER_WORKER: usize = 1 << 15;
 
-
+/// A byte with no matching token (partial vocabularies only).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncodeError {
+    /// Offset of the unencodable byte in the input.
     pub byte_offset: usize,
+    /// The unencodable byte.
     pub byte: u8,
 }
 
@@ -30,9 +56,13 @@ impl fmt::Display for EncodeError {
 }
 impl std::error::Error for EncodeError {}
 
+/// An [`EncodeError`] tagged with the failing document.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BatchEncodeError {
+    /// Index of the first failing document.
     pub document_index: usize,
+    /// The underlying error.
     pub source: EncodeError,
 }
 impl fmt::Display for BatchEncodeError {
@@ -44,9 +74,18 @@ impl std::error::Error for BatchEncodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.source) }
 }
 
-#[derive(Debug)]
+/// Why decoding failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
-    MissingToken { token_index: usize, token_id: u32 },
+    /// The ID is out of range or has no entry (including reserved ID 0).
+    MissingToken {
+        /// Position in the input slice.
+        token_index: usize,
+        /// The offending ID.
+        token_id: u32,
+    },
+    /// The decoded bytes are not valid UTF-8.
     InvalidUtf8(std::string::FromUtf8Error),
 }
 
@@ -59,14 +98,62 @@ impl fmt::Display for DecodeError {
         }
     }
 }
-impl std::error::Error for DecodeError {}
-
-/// Parse the Python-style literal subset used by `rwkv_vocab_v20230424.txt`.
-pub fn parse_python_literal_pub(s: &str) -> Option<Vec<u8>> {
-    parse_python_literal(s)
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidUtf8(error) => Some(error),
+            Self::MissingToken { .. } => None,
+        }
+    }
 }
 
+/// Why a vocabulary could not be loaded.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum VocabError {
+    /// The vocabulary file could not be read.
+    Io {
+        /// The file that failed to load.
+        path: std::path::PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+    /// The vocabulary text is malformed; the message names the line and problem.
+    Invalid(String),
+}
+
+impl fmt::Display for VocabError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { path, source } => write!(f, "{path:?}: {source}"),
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+impl std::error::Error for VocabError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Invalid(_) => None,
+        }
+    }
+}
+
+/// Parse an unsigned decimal made only of ASCII digits (no sign, no spaces).
+fn digits<T: std::str::FromStr>(text: &str) -> Option<T> {
+    text.bytes().all(|byte| byte.is_ascii_digit()).then(|| text.parse().ok()).flatten()
+}
+
+/// Parse the Python-style literal subset used by `rwkv_vocab_v20230424.txt`.
+#[cfg(test)]
 fn parse_python_literal(s: &str) -> Option<Vec<u8>> {
+    let mut result = Vec::new();
+    parse_python_literal_into(s, &mut result)?;
+    Some(result)
+}
+
+/// Same grammar, writing into a reusable buffer (cleared first).
+fn parse_python_literal_into(s: &str, result: &mut Vec<u8>) -> Option<()> {
     let (is_bytes, s) = match s.strip_prefix('b') {
         Some(rest) => (true, rest),
         None => (false, s),
@@ -77,7 +164,11 @@ fn parse_python_literal(s: &str) -> Option<Vec<u8>> {
     }
     let quote = raw[0];
     let inner = &raw[1..raw.len() - 1];
-    let mut result = Vec::with_capacity(inner.len());
+    result.clear();
+    if !inner.iter().any(|&byte| byte == b'\\' || byte == quote || (is_bytes && !byte.is_ascii())) {
+        result.extend_from_slice(inner);
+        return Some(());
+    }
     let mut utf8 = [0u8; 4];
     let mut i = 0;
     while i < inner.len() {
@@ -99,19 +190,19 @@ fn parse_python_literal(s: &str) -> Option<Vec<u8>> {
             b'0' => result.push(0),
             b'x' => {
                 if i + 4 > inner.len() { return None; }
-                let hex = std::str::from_utf8(&inner[i + 2..i + 4]).ok()?;
+                let hex = std::str::from_utf8(&inner[i + 2..i + 4]).ok().filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))?;
                 let value = u8::from_str_radix(hex, 16).ok()?;
                 if is_bytes {
                     result.push(value);
                 } else {
-                    result.extend_from_slice(char::from_u32(value as u32)?.encode_utf8(&mut utf8).as_bytes());
+                    result.extend_from_slice(char::from_u32(u32::from(value))?.encode_utf8(&mut utf8).as_bytes());
                 }
                 i += 4;
                 continue;
             }
             b'u' => {
                 if is_bytes || i + 6 > inner.len() { return None; }
-                let hex = std::str::from_utf8(&inner[i + 2..i + 6]).ok()?;
+                let hex = std::str::from_utf8(&inner[i + 2..i + 6]).ok().filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))?;
                 let value = u32::from_str_radix(hex, 16).ok()?;
                 result.extend_from_slice(char::from_u32(value)?.encode_utf8(&mut utf8).as_bytes());
                 i += 6;
@@ -121,11 +212,16 @@ fn parse_python_literal(s: &str) -> Option<Vec<u8>> {
         }
         i += 2;
     }
-    Some(result)
+    Some(())
 }
 
+/// Greedy longest-match RWKV World tokenizer. Cloning shares the vocabulary.
 #[derive(Debug, Clone)]
 pub struct RwkvTokenizer { data: Arc<TokenizerData> }
+
+/// Construction-time trie node; the edge from its parent is `label`.
+#[derive(Clone, Copy, Default)]
+struct Node { head: u32, tail: u32, next: u32, term: u16, count: u16, label: u8 }
 
 #[derive(Debug)]
 struct TokenizerData {
@@ -139,30 +235,41 @@ struct TokenizerData {
 
 impl RwkvTokenizer {
     /// Load the bundled official RWKV World vocabulary. No file or download needed.
-    pub fn bundled() -> Result<Self, String> {
+    pub fn bundled() -> Result<Self, VocabError> {
         Self::from_vocab_str(include_str!("../vocab/rwkv_vocab_v20230424.txt"))
     }
 
-    pub fn from_file(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|error| format!("{path:?}: {error}"))?;
+    /// Load a vocabulary file; same rules as [`Self::from_vocab_str`].
+    pub fn from_file(path: &Path) -> Result<Self, VocabError> {
+        let text = std::fs::read_to_string(path).map_err(|source| VocabError::Io { path: path.to_path_buf(), source })?;
         Self::from_vocab_str(&text)
     }
 
     /// Load a normal vocabulary and require every byte to have a singleton.
-    pub fn from_vocab_str(text: &str) -> Result<Self, String> {
-        Self::from_vocab_str_mode(text, false)
+    pub fn from_vocab_str(text: &str) -> Result<Self, VocabError> {
+        Self::from_vocab_str_mode(text, false).map_err(VocabError::Invalid)
     }
 
     /// Explicit partial-vocabulary mode. Missing IDs and singleton bytes are
     /// allowed, but checked encoding reports the first missing byte.
-    pub fn from_vocab_str_partial(text: &str) -> Result<Self, String> {
-        Self::from_vocab_str_mode(text, true)
+    pub fn from_vocab_str_partial(text: &str) -> Result<Self, VocabError> {
+        Self::from_vocab_str_mode(text, true).map_err(VocabError::Invalid)
     }
 
     fn from_vocab_str_mode(text: &str, partial: bool) -> Result<Self, String> {
         let permit = cooperate::acquire();
-        let mut idx2tok: Vec<Option<Vec<u8>>> = vec![None; VOCAB_SIZE];
-        let mut seen = std::collections::HashSet::new();
+        // Tokens are stored in ID order as they are parsed (IDs are strictly ascending),
+        // and inserted into the trie immediately: a terminal that is already set is a
+        // duplicate, so no HashSet<Vec<u8>> or per-ID Option<Vec<u8>> is needed.
+        let mut tok_blob: Vec<u8> = Vec::with_capacity(text.len() / 2);
+        let mut tok_off: Vec<u32> = Vec::with_capacity(VOCAB_SIZE + 1);
+        let mut single = [-1i32; 256];
+        let mut trie_roots = vec![0u32; 256 * 256];
+        // Flat trie: the edge into node `n` lives in `nodes[n]` (`label`), siblings are a
+        // linked list in insertion order, so no per-node allocation is needed.
+        let mut nodes: Vec<Node> = Vec::with_capacity(120_000);
+        nodes.push(Node::default());
+        let mut bytes: Vec<u8> = Vec::new();
         let mut previous_id = None;
         let mut parsed = 0usize;
         for (line_index, raw_line) in text.lines().enumerate() {
@@ -177,10 +284,12 @@ impl RwkvTokenizer {
                 return Err(format!("malformed vocabulary line {line_number}: {line:?}"));
             }
             let id_text = &line[..first];
-            let id: u32 = id_text.parse().map_err(|_| format!("bad token ID at line {line_number}: {id_text:?}"))?;
-            if id as usize >= VOCAB_SIZE {
+            // Plain ASCII digits only: `str::parse` would also accept a leading `+`.
+            let id: u32 = digits(id_text).ok_or_else(|| format!("bad token ID at line {line_number}: {id_text:?}"))?;
+            // VOCAB_SIZE == 1 << 16, so every in-range ID fits u16.
+            let Ok(id16) = u16::try_from(id) else {
                 return Err(format!("token ID {id} at line {line_number} exceeds {VOCAB_SIZE}"));
-            }
+            };
             if id == RESERVED_TOKEN_ID {
                 return Err(format!("token ID 0 is reserved at line {line_number}"));
             }
@@ -198,117 +307,148 @@ impl RwkvTokenizer {
             if length_text.bytes().any(|byte| byte.is_ascii_whitespace()) {
                 return Err(format!("bad token length at line {line_number}: {length_text:?}"));
             }
-            let wanted: usize = length_text.parse().map_err(|_| format!("bad token length at line {line_number}: {length_text:?}"))?;
-            let bytes = parse_python_literal(literal).ok_or_else(|| format!("bad literal at line {line_number}: {literal:?}"))?;
+            let wanted: usize = digits(length_text).ok_or_else(|| format!("bad token length at line {line_number}: {length_text:?}"))?;
+            parse_python_literal_into(literal, &mut bytes).ok_or_else(|| format!("bad literal at line {line_number}: {literal:?}"))?;
             if bytes.is_empty() { return Err(format!("empty token at line {line_number} for ID {id}")); }
             if bytes.len() != wanted { return Err(format!("length mismatch for ID {id} at line {line_number}")); }
             if bytes.len() > u8::MAX as usize {
                 return Err(format!("token ID {id} at line {line_number} length {} exceeds u8 storage", bytes.len()));
             }
-            if !seen.insert(bytes.clone()) { return Err(format!("duplicate token bytes at line {line_number} for ID {id}")); }
-            idx2tok[id as usize] = Some(bytes);
+            let duplicate = || format!("duplicate token bytes at line {line_number} for ID {id}");
+            if bytes.len() == 1 {
+                if single[bytes[0] as usize] >= 0 { return Err(duplicate()); }
+                single[bytes[0] as usize] = i32::from(id16);
+            } else {
+                let root = bytes[0] as usize * 256 + bytes[1] as usize;
+                if trie_roots[root] == 0 {
+                    trie_roots[root] = u32::try_from(nodes.len()).map_err(|_| "trie exceeds u32")?;
+                    nodes.push(Node::default());
+                }
+                let mut node = trie_roots[root] as usize;
+                for &byte in &bytes[2..] {
+                    let mut child = nodes[node].head;
+                    while child != 0 && nodes[child as usize].label != byte { child = nodes[child as usize].next; }
+                    if child == 0 {
+                        child = u32::try_from(nodes.len()).map_err(|_| "trie exceeds u32")?;
+                        nodes.push(Node { label: byte, ..Node::default() });
+                        if nodes[node].head == 0 { nodes[node].head = child; } else { let tail = nodes[node].tail as usize; nodes[tail].next = child; }
+                        nodes[node].tail = child;
+                        nodes[node].count += 1;
+                    }
+                    node = child as usize;
+                }
+                if nodes[node].term != 0 { return Err(duplicate()); }
+                nodes[node].term = id16;
+            }
+            // tok_off[i] = blob length before ID i; IDs without a token repeat the offset.
+            let offset = u32::try_from(tok_blob.len()).map_err(|_| "decode storage exceeds u32".to_owned())?;
+            tok_off.resize(usize::from(id16) + 1, offset);
+            tok_blob.extend_from_slice(&bytes);
             parsed += 1;
         }
         if parsed == 0 { return Err("vocabulary is empty".to_owned()); }
+        let end = u32::try_from(tok_blob.len()).map_err(|_| "decode storage exceeds u32".to_owned())?;
+        tok_off.resize(VOCAB_SIZE + 1, end);
 
-        let mut single = [-1i32; 256];
-        let mut tok_blob = Vec::new();
-        let mut tok_off = Vec::with_capacity(VOCAB_SIZE + 1);
-        for token in &idx2tok {
-            tok_off.push(u32::try_from(tok_blob.len()).map_err(|_| "decode storage exceeds u32".to_owned())?);
-            if let Some(token) = token {
-                let new_len = tok_blob.len().checked_add(token.len()).ok_or_else(|| "decode storage overflow".to_owned())?;
-                if new_len > u32::MAX as usize { return Err("decode storage exceeds u32".to_owned()); }
-                tok_blob.extend_from_slice(token);
-            }
-        }
-        tok_off.push(u32::try_from(tok_blob.len()).map_err(|_| "decode storage exceeds u32".to_owned())?);
-
-        // Direct two-byte roots avoid searching the two highest-fanout levels.
-        // Node zero is the missing-root sentinel; token zero is never terminal.
-        let mut trie_roots = vec![0u32; 256 * 256];
-        let mut build: Vec<(u16, Vec<(u8, u32)>)> = vec![(0, Vec::new())];
-        for (id, token) in idx2tok.iter().enumerate() {
-            let Some(token) = token.as_deref() else { continue };
-            if token.len() == 1 {
-                single[token[0] as usize] = id as i32;
-                continue;
-            }
-            let root = token[0] as usize * 256 + token[1] as usize;
-            if trie_roots[root] == 0 {
-                trie_roots[root] = u32::try_from(build.len()).map_err(|_| "trie exceeds u32")?;
-                build.push((0, Vec::new()));
-            }
-            let mut node = trie_roots[root] as usize;
-            for &byte in &token[2..] {
-                // ponytail: construction scans at most 256 siblings; add an index if load time dominates.
-                let found = build[node].1.iter().find(|edge| edge.0 == byte).map(|edge| edge.1);
-                let child = if let Some(child) = found { child } else {
-                    let child = u32::try_from(build.len()).map_err(|_| "trie exceeds u32")?;
-                    build.push((0, Vec::new()));
-                    build[node].1.push((byte, child));
-                    child
-                };
-                node = child as usize;
-            }
-            // Vocabulary loading already rejects IDs outside 1..65535.
-            build[node].0 = id as u16;
-        }
         // A state packs a unique XOR base, terminal ID, and incoming byte.
         // Unique bases make the incoming byte a sufficient ownership check:
         // base_a ^ byte == base_b ^ byte implies base_a == base_b.
-        let mut bases = vec![0usize; build.len()];
-        let mut used = vec![true; 256]; // base zero is the all-missing leaf table
+        let mut bases = vec![0usize; nodes.len()];
+        // Occupancy bitset, 4 words per 256-slot block. Block zero is the all-missing
+        // leaf table. Every node's slots share one block (base ^ label stays inside it).
+        let mut used: Vec<u64> = vec![!0u64; 4];
         let mut used_bases = vec![true; 256];
-        // Successor links skip occupied slots instead of repeatedly scanning them.
-        fn next_free(links: &mut [usize], mut slot: usize) -> usize {
-            let mut root = slot;
-            while links[root] != root { root = links[root]; }
-            while links[slot] != slot {
-                let next = links[slot]; links[slot] = root; slot = next;
+        // Bit i of the result is bit i ^ d of `word`.
+        fn xor_perm(mut word: u64, d: usize) -> u64 {
+            const MASKS: [u64; 5] = [0x5555_5555_5555_5555, 0x3333_3333_3333_3333, 0x0f0f_0f0f_0f0f_0f0f, 0x00ff_00ff_00ff_00ff, 0x0000_ffff_0000_ffff];
+            for (bit, mask) in MASKS.iter().enumerate() {
+                if d >> bit & 1 != 0 { word = (word & mask) << (1 << bit) | (word >> (1 << bit)) & mask; }
             }
-            root
+            if d & 32 != 0 { word = word.rotate_left(32); }
+            word
         }
-        let mut free_links: Vec<usize> = (0..=256).collect();
-        let mut order: Vec<_> = (1..build.len()).filter(|&node| !build[node].1.is_empty()).collect();
-        order.sort_unstable_by_key(|&node| std::cmp::Reverse(build[node].1.len()));
+        let mut order: Vec<_> = (1..nodes.len()).filter(|&node| nodes[node].count != 0).collect();
+        // Node index breaks ties: sort_unstable leaves equal keys in an unspecified,
+        // std-version-dependent order, which would make the pinned layout fragile.
+        order.sort_unstable_by_key(|&node| (std::cmp::Reverse(nodes[node].count), node));
         let mut first_free = 256usize;
-        let mut search_cursors = std::collections::HashMap::<Vec<u8>, usize>::new();
+        let mut cursor_of = std::collections::HashMap::<Vec<u8>, usize>::new();
+        let mut cursors: Vec<usize> = Vec::new();
+        let mut labels: Vec<u8> = Vec::new();
         for node in order {
-            let edges = &build[node].1;
-            let pivot = edges[0].0 as usize;
+            labels.clear();
+            let mut child = nodes[node].head;
+            while child != 0 { labels.push(nodes[child as usize].label); child = nodes[child as usize].next; }
+            let pivot = labels[0] as usize;
             // Identical label patterns have identical placement constraints. Earlier
             // rejected slots stay invalid because occupied slots and used bases only grow.
-            let labels: Vec<u8> = edges.iter().map(|edge| edge.0).collect();
-            let cursor = search_cursors.entry(labels).or_insert(256);
-            let mut slot = first_free.max(*cursor);
-            let base = loop {
-                let base = slot ^ pivot;
-                let required = (base | 255) + 1;
-                if required > used.len() {
-                    free_links.extend(used.len()+1..=required);
-                    used.resize(required, false); used_bases.resize(required, false);
+            let cursor_index = match cursor_of.get(labels.as_slice()) {
+                Some(&index) => index,
+                None => { cursors.push(256); cursor_of.insert(labels.clone(), cursors.len() - 1); cursors.len() - 1 }
+            };
+            let start = first_free.max(cursors[cursor_index]);
+            // Smallest free slot >= start whose base (slot ^ pivot) is unused and whose
+            // every other label slot is free. 64 candidate slots are filtered per word.
+            let (slot, base) = 'search: {
+                let mut block = start >> 8;
+                let mut from = start & 255;
+                loop {
+                    if block * 4 >= used.len() {
+                        used.extend([0u64; 4]);
+                        used_bases.resize(used_bases.len() + 256, false);
+                    }
+                    // Whole 256-slot block at once: the label loop is branch-predictable
+                    // (one `d` per label) and exits as soon as no candidate survives.
+                    let words = block * 4;
+                    let free = [!used[words], !used[words + 1], !used[words + 2], !used[words + 3]];
+                    let mut cands = free;
+                    for cand in cands.iter_mut().take(from >> 6) { *cand = 0; }
+                    cands[from >> 6] &= !0u64 << (from & 63);
+                    for &label in &labels[1..] {
+                        let d = pivot ^ label as usize;
+                        let mut any = 0;
+                        for (w, cand) in cands.iter_mut().enumerate() {
+                            *cand &= xor_perm(free[w ^ (d >> 6 & 3)], d & 63);
+                            any |= *cand;
+                        }
+                        if any == 0 { break; }
+                    }
+                    for (w, &word) in cands.iter().enumerate() {
+                        let mut cand = word;
+                        while cand != 0 {
+                            let slot = block << 8 | w << 6 | cand.trailing_zeros() as usize;
+                            cand &= cand - 1;
+                            let base = slot ^ pivot;
+                            if base >= 256 && !used_bases[base] { break 'search (slot, base); }
+                        }
+                    }
+                    block += 1;
+                    from = 0;
                 }
-                if base >= 256 && !used_bases[base] && edges.iter().all(|&(label,_)| !used[base ^ label as usize]) {
-                    break base;
-                }
-                slot = next_free(&mut free_links, slot+1);
             };
             u32::try_from(base).map_err(|_| "transition table exceeds u32")?;
             bases[node] = base;
-            *cursor = slot + 1;
+            cursors[cursor_index] = slot + 1;
             used_bases[base] = true;
-            for &(label, _) in edges {
+            for &label in &labels {
                 let slot = base ^ label as usize;
-                used[slot] = true;
-                free_links[slot] = next_free(&mut free_links,slot+1);
+                used[slot >> 6] |= 1 << (slot & 63);
             }
-            first_free = next_free(&mut free_links,first_free);
+            while first_free >> 6 < used.len() {
+                let free = !used[first_free >> 6] & (!0u64 << (first_free & 63));
+                if free != 0 { first_free = first_free & !63 | free.trailing_zeros() as usize; break; }
+                first_free = ((first_free >> 6) + 1) << 6;
+            }
         }
-        let state = |node: usize, label: u8| (bases[node] as u64) << 32 | (build[node].0 as u64) << 8 | label as u64;
-        let mut transitions = vec![0u64; used.len()];
-        for (node,(_,edges)) in build.iter().enumerate() {
-            for &(label,child) in edges { transitions[bases[node] ^ label as usize] = state(child as usize,label); }
+        let state = |node: usize, label: u8| (bases[node] as u64) << 32 | u64::from(nodes[node].term) << 8 | u64::from(label);
+        let mut transitions = vec![0u64; used.len() * 64];
+        for (node, entry) in nodes.iter().enumerate() {
+            let mut child = entry.head;
+            while child != 0 {
+                let label = nodes[child as usize].label;
+                transitions[bases[node] ^ label as usize] = state(child as usize, label);
+                child = nodes[child as usize].next;
+            }
         }
         let trie_roots: Vec<u64> = trie_roots.into_iter().map(|node| if node==0 {0} else {state(node as usize,0)}).collect();
 
@@ -317,14 +457,23 @@ impl RwkvTokenizer {
                 if *id < 0 { return Err(format!("missing singleton byte 0x{byte:02x}")); }
             }
         }
+        tok_blob.extend_from_slice(&[0; 8]); // decode_run reads whole 8-byte blocks
+        tok_blob.shrink_to_fit();
         permit.finish(text.len());
         Ok(Self { data: Arc::new(TokenizerData { tok_blob, tok_off, single, trie_roots, transitions, partial }) })
     }
 
+    /// Always [`VOCAB_SIZE`].
     pub fn vocab_size(&self) -> usize { VOCAB_SIZE }
+    /// True if built by [`Self::from_vocab_str_partial`].
     pub fn is_partial(&self) -> bool { self.data.partial }
 
-    #[inline]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "state packs base in bits 32.., id in bits 8..24, label in bits 0..8, so each narrowing cast keeps exactly its field; `single` entries are checked >= 0; the match length is at most 255 because tokens are stored with u8 lengths"
+    )]
+    #[inline(always)]
     fn match_at(&self, src: &[u8], i: usize) -> (u32,u8) {
         let first = src[i] as usize;
         let mut best = (0u32,0u8);
@@ -333,7 +482,7 @@ impl RwkvTokenizer {
             if state != 0 {
                 let id = (state >> 8) as u16;
                 if id != 0 {
-                    best = (id as u32,2);
+                    best = (u32::from(id),2);
                     if state >> 32 == 0 { return best; }
                 }
                 for (offset,&byte) in src[i+2..].iter().enumerate() {
@@ -342,7 +491,7 @@ impl RwkvTokenizer {
                     state = next;
                     let id = (state >> 8) as u16;
                     // Every later terminal is a longer match, regardless of ID.
-                    if id != 0 { best = (id as u32,(offset+3) as u8); }
+                    if id != 0 { best = (u32::from(id),(offset+3) as u8); }
                     if state >> 32 == 0 { break; }
                 }
             }
@@ -352,31 +501,32 @@ impl RwkvTokenizer {
         else {(0,0)}
     }
 
+    /// Permit-free inner loop: with no Drop in scope, `i` and the output
+    /// length stay in registers. Returns the next offset or the failing one.
+    #[inline(never)]
+    fn match_run(&self, src: &[u8], mut i: usize, end: usize, out: &mut Vec<u32>) -> Result<usize, usize> {
+        while i < end {
+            // Match against the entire input: tokens can cross a quantum boundary.
+            let (id, len) = self.match_at(src, i);
+            if len == 0 { return Err(i); }
+            out.push(id);
+            i += len as usize;
+        }
+        Ok(i)
+    }
+
     fn encode_sequential_bytes(&self, src: &[u8]) -> Result<Vec<u32>, EncodeError> {
         let mut result = Vec::with_capacity(src.len() / 3 + 8);
         let mut i = 0;
         while i < src.len() {
-            let permit = cooperate::acquire();
+            let permit = cooperate::acquire_for(src.len());
             let end = i.saturating_add(permit.byte_budget()).min(src.len());
             let start = i;
-            while i < end {
-                // Match against the entire input: tokens can cross a quantum boundary.
-                let (id, len) = self.match_at(src, i);
-                if len == 0 { return Err(EncodeError { byte_offset: i, byte: src[i] }); }
-                result.push(id);
-                i += len as usize;
-            }
+            i = self.match_run(src, i, end, &mut result)
+                .map_err(|at| EncodeError { byte_offset: at, byte: src[at] })?;
             permit.finish(i - start);
         }
         Ok(result)
-    }
-
-    /// Sequential greedy encoding under the shared CPU budget.
-    pub fn encode_sequential(&self, src: &[u8]) -> Result<Vec<u32>, EncodeError> { self.encode_sequential_bytes(src) }
-
-    /// Explicit parallel matching, capped by the process-wide CPU budget.
-    pub fn encode_parallel_with_workers(&self, src: &[u8], workers: usize) -> Result<Vec<u32>, EncodeError> {
-        self.encode_with_policy(src, workers, PARALLEL_MIN_BYTES)
     }
 
     fn copy_input(src: &[u8]) -> Vec<u8> {
@@ -392,16 +542,14 @@ impl RwkvTokenizer {
         copy
     }
 
-    /// Zero/one workers stay sequential. Larger requests share the global pool.
-    pub fn encode_with_policy(&self, src: &[u8], workers: usize, min_bytes: usize) -> Result<Vec<u32>, EncodeError> {
-        self.encode_with_policy_report(src, workers, min_bytes).map(|(tokens, _)| tokens)
-    }
-
-    /// Encode and report the effective matching job count from this call.
-    /// One means sequential (including empty input); larger counts mean the
-    /// parallel matching path. Jobs share the pool and CPU budget, so this is
-    /// not a measurement of simultaneous OS threads.
-    pub fn encode_with_policy_report(&self, src: &[u8], workers: usize, min_bytes: usize) -> Result<(Vec<u32>, usize), EncodeError> {
+    /// Encode with an explicit worker count and parallel threshold. Zero or one
+    /// workers, or input shorter than `min_bytes`, stay sequential; larger
+    /// requests share the global pool and CPU budget.
+    ///
+    /// Returns the tokens and the effective matching job count for this call:
+    /// one means sequential (including empty input), larger counts mean the
+    /// parallel path. It is not a measurement of simultaneous OS threads.
+    pub fn encode_with_policy(&self, src: &[u8], workers: usize, min_bytes: usize) -> Result<(Vec<u32>, usize), EncodeError> {
         self.encode_with_worker_limit(src, workers, min_bytes, cooperate::worker_limit())
     }
 
@@ -428,12 +576,14 @@ impl RwkvTokenizer {
                     permit.finish(stop - i);
                     i = stop;
                 }
+                #[expect(clippy::expect_used, reason = "the receiver outlives every sender: the caller drains it until all senders drop")]
                 sender.send((start / chunk, matches)).expect("matching receiver closed");
             });
         }
         drop(sender);
         let mut parts = vec![None; src.len().div_ceil(chunk)];
         for (index, matches) in receiver { parts[index] = Some(matches); }
+        #[expect(clippy::expect_used, reason = "every part is filled unless its worker panicked; panicking here propagates that failure")]
         let parts: Vec<_> = parts.into_iter().map(|part| part.expect("matching worker panicked")).collect();
         let mut result = Vec::with_capacity(src.len() / 3 + 8);
         let mut i = 0;
@@ -452,14 +602,20 @@ impl RwkvTokenizer {
         Ok((result, src.len().div_ceil(chunk)))
     }
 
+    /// Parallel matching at the current CPU-budget worker cap (sequential below
+    /// [`PARALLEL_MIN_BYTES`]).
     pub fn encode_parallel(&self, src: &[u8]) -> Result<Vec<u32>, EncodeError> {
-        self.encode_parallel_with_workers(src, cooperate::worker_limit())
+        self.encode_with_policy(src, cooperate::worker_limit(), PARALLEL_MIN_BYTES).map(|(tokens, _)| tokens)
     }
 
     /// Encode documents through a shared queue and preserve input order.
     /// Errors identify the first failing document and its byte offset.
     pub fn encode_batch(&self, texts: &[&str], workers: usize) -> Result<Vec<Vec<u32>>, BatchEncodeError> {
-        let workers = workers.max(1).min(cooperate::worker_limit()).min(texts.len());
+        self.encode_batch_with_worker_limit(texts, workers, cooperate::worker_limit())
+    }
+
+    fn encode_batch_with_worker_limit(&self, texts: &[&str], workers: usize, worker_limit: usize) -> Result<Vec<Vec<u32>>, BatchEncodeError> {
+        let workers = workers.max(1).min(worker_limit).min(texts.len());
         if workers <= 1 {
             return texts.iter().enumerate().map(|(document_index, text)| {
                 self.encode_sequential_bytes(text.as_bytes()).map_err(|source| BatchEncodeError { document_index, source })
@@ -467,17 +623,25 @@ impl RwkvTokenizer {
         }
         let inputs = Arc::new(texts.iter().map(|text| Self::copy_input(text.as_bytes())).collect::<Vec<_>>());
         let next = Arc::new(AtomicUsize::new(0));
+        // Lowest failing document so far: later documents cannot change the answer.
+        let first_bad = Arc::new(AtomicUsize::new(usize::MAX));
         let (sender, receiver) = mpsc::channel();
         for _ in 0..workers {
             let inputs = Arc::clone(&inputs);
             let next = Arc::clone(&next);
+            let first_bad = Arc::clone(&first_bad);
             let tokenizer = self.clone();
             let sender = sender.clone();
             cooperate::submit(move || {
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(input) = inputs.get(index) else { break };
+                    if index > first_bad.load(Ordering::Relaxed) { continue; }
+                    #[cfg(test)]
+                    tests::BATCH_ENCODED.fetch_add(1, Ordering::Relaxed);
                     let result = tokenizer.encode_sequential_bytes(input);
+                    if result.is_err() { first_bad.fetch_min(index, Ordering::Relaxed); }
+                    #[expect(clippy::expect_used, reason = "the receiver outlives every sender: the caller drains it until all senders drop")]
                     sender.send((index, result)).expect("batch receiver closed");
                 }
             });
@@ -486,7 +650,10 @@ impl RwkvTokenizer {
         let mut output = vec![None; texts.len()];
         for (index, result) in receiver { output[index] = Some(result); }
         output.into_iter().enumerate().map(|(document_index, result)| {
-            result.expect("batch worker panicked").map_err(|source| BatchEncodeError { document_index, source })
+            // Slots after the first failing document may be skipped; `collect` stops at that failure first.
+            #[expect(clippy::expect_used, reason = "every slot up to the first failure is filled unless its worker panicked; panicking here propagates that failure")]
+            let result = result.expect("batch worker panicked");
+            result.map_err(|source| BatchEncodeError { document_index, source })
         }).collect()
     }
 
@@ -497,68 +664,73 @@ impl RwkvTokenizer {
         self.encode_batch(texts, workers)
     }
 
+    /// Encode text sequentially.
     pub fn encode(&self, src: &str) -> Result<Vec<u32>, EncodeError> { self.encode_bytes(src.as_bytes()) }
 
+    /// Encode arbitrary bytes sequentially; errors only on a partial vocabulary.
     pub fn encode_bytes(&self, src: &[u8]) -> Result<Vec<u32>, EncodeError> {
         self.encode_sequential_bytes(src)
     }
 
-    pub fn encode_checked(&self, src: &str) -> Result<Vec<u32>, EncodeError> {
-        self.encode(src)
-    }
-
-    pub fn encode_bytes_checked(&self, src: &[u8]) -> Result<Vec<u32>, EncodeError> {
-        self.encode_bytes(src)
-    }
-
+    /// Concatenate token bytes; errors on an unknown ID.
     pub fn decode_bytes(&self, tokens: &[u32]) -> Result<Vec<u8>, DecodeError> {
-        self.decode_bytes_checked(tokens)
+        self.decode_then(tokens, |bytes| bytes)
     }
 
-    pub fn decode_bytes_checked(&self, tokens: &[u32]) -> Result<Vec<u8>, DecodeError> {
+    /// Permit-free decode loop. Tokens of at most 8 bytes are copied as a fixed
+    /// 8-byte block (one mov, no memcpy call; `tok_blob` has 8 bytes of padding)
+    /// and the length is trimmed afterwards. Returns the next index or the failing one.
+    #[inline(never)]
+    fn decode_run(&self, tokens: &[u32], mut index: usize, stop: usize, out: &mut Vec<u8>) -> Result<usize, usize> {
+        let data = &*self.data;
+        while index < stop {
+            let Some(id) = usize::try_from(tokens[index]).ok().filter(|&id| id < VOCAB_SIZE) else { return Err(index) };
+            let (start, end) = (data.tok_off[id] as usize, data.tok_off[id + 1] as usize);
+            if start == end { return Err(index); }
+            let produced = out.len();
+            if end - start <= 8 {
+                let block: [u8; 8] = data.tok_blob[start..start + 8].try_into().unwrap_or([0; 8]);
+                out.extend_from_slice(&block);
+                out.truncate(produced + end - start);
+            } else {
+                out.extend_from_slice(&data.tok_blob[start..end]);
+            }
+            index += 1;
+        }
+        Ok(index)
+    }
+
+    /// Decode under the shared budget; `tail` runs inside the final permit,
+    /// so UTF-8 conversion does not pay for a second gate pass.
+    fn decode_then<R>(&self, tokens: &[u32], tail: impl FnOnce(Vec<u8>) -> R) -> Result<R, DecodeError> {
         let mut result = Vec::with_capacity(tokens.len() * 4);
-        let mut index = 0;
-        while index < tokens.len() {
-            let permit = cooperate::acquire();
+        let mut index = 0usize;
+        loop {
+            let permit = cooperate::acquire_for(tokens.len().saturating_mul(4));
             let stop = index.saturating_add(permit.byte_budget() / 4).min(tokens.len());
             let produced = result.len();
-            while index < stop {
-            let token_id = tokens[index];
-            let Some(id) = usize::try_from(token_id).ok().filter(|&id| id < VOCAB_SIZE) else {
-                return Err(DecodeError::MissingToken { token_index: index, token_id });
-            };
-            let start = self.data.tok_off[id] as usize;
-            let end = self.data.tok_off[id + 1] as usize;
-            if start == end {
-                return Err(DecodeError::MissingToken { token_index: index, token_id });
+            index = self.decode_run(tokens, index, stop, &mut result)
+                .map_err(|at| DecodeError::MissingToken { token_index: at, token_id: tokens[at] })?;
+            let decoded = result.len() - produced;
+            if index == tokens.len() {
+                let output = tail(result);
+                permit.finish(decoded);
+                return Ok(output);
             }
-            result.extend_from_slice(&self.data.tok_blob[start..end]);
-            index += 1;
-            }
-            permit.finish(result.len() - produced);
+            permit.finish(decoded);
         }
-        Ok(result)
     }
 
+    /// Decode to text; errors on an unknown ID or invalid UTF-8.
     pub fn decode_utf8(&self, tokens: &[u32]) -> Result<String, DecodeError> {
-        let bytes = self.decode_bytes(tokens)?;
-        let permit = cooperate::acquire();
-        let size = bytes.len();
-        let result = String::from_utf8(bytes).map_err(DecodeError::InvalidUtf8);
-        permit.finish(size);
-        result
+        self.decode_then(tokens, String::from_utf8)?.map_err(DecodeError::InvalidUtf8)
     }
 
-    pub fn decode_utf8_checked(&self, tokens: &[u32]) -> Result<String, DecodeError> {
-        self.decode_utf8(tokens)
-    }
-
+    /// Decode to text, replacing invalid UTF-8 with U+FFFD; errors only on an unknown ID.
     pub fn decode_lossy(&self, tokens: &[u32]) -> Result<String, DecodeError> {
-        let bytes = self.decode_bytes(tokens)?;
-        let permit = cooperate::acquire();
-        let result = String::from_utf8_lossy(&bytes).into_owned();
-        permit.finish(bytes.len());
-        Ok(result)
+        // Valid UTF-8 (the common case) is moved, not copied.
+        self.decode_then(tokens, |bytes| String::from_utf8(bytes)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
     }
 }
 
@@ -641,9 +813,9 @@ mod tests {
     fn valid_fixture() -> String {
         let mut result = String::new();
         for id in 1..=65_529u32 {
-            let bytes = if id <= 256 { vec![(id - 1) as u8] } else {
+            let bytes = if id <= 256 { vec![u8::try_from(id - 1).unwrap()] } else {
                 let pair = id - 257;
-                vec![(pair & 255) as u8, (pair >> 8) as u8]
+                vec![u8::try_from(pair & 255).unwrap(), u8::try_from(pair >> 8).unwrap()]
             };
             result.push_str(&format!("{id} {} {}\n", literal(&bytes), bytes.len()));
         }
@@ -700,11 +872,11 @@ mod tests {
             ("2 b'a' 1\n1 b'b' 1", "ascending order"), ("0 b'a' 1", "reserved"),
             ("1 b'a' 1\n2 b'a' 1", "duplicate token bytes"),
         ] {
-            let error = RwkvTokenizer::from_vocab_str_partial(text).unwrap_err();
+            let error = RwkvTokenizer::from_vocab_str_partial(text).unwrap_err().to_string();
             assert!(error.contains(expected), "{text:?}: {error}");
         }
         let long = vec![b'a'; 256];
-        let error = RwkvTokenizer::from_vocab_str_partial(&format!("1 {} {}", literal(&long), long.len())).unwrap_err();
+        let error = RwkvTokenizer::from_vocab_str_partial(&format!("1 {} {}", literal(&long), long.len())).unwrap_err().to_string();
         assert!(error.contains("u8 storage"), "{error}");
     }
 
@@ -725,24 +897,17 @@ mod tests {
         let text = "1 b'a' 1\n2 b'b' 1\n";
         let tokenizer = RwkvTokenizer::from_vocab_str_partial(text).unwrap();
         assert!(tokenizer.is_partial());
-        assert_eq!(tokenizer.encode_bytes_checked(b"ab"), Ok(vec![1, 2]));
-        assert_eq!(tokenizer.encode_bytes_checked(b"ac"), Err(EncodeError { byte_offset: 1, byte: b'c' }));
+        assert_eq!(tokenizer.encode_bytes(b"ab"), Ok(vec![1, 2]));
         for result in [
             tokenizer.encode("ac"),
             tokenizer.encode_bytes(b"ac"),
-            tokenizer.encode_sequential(b"ac"),
             tokenizer.encode_parallel(b"ac"),
-            tokenizer.encode_parallel_with_workers(b"ac", 2),
-            tokenizer.encode_checked("ac"),
-            tokenizer.encode_bytes_checked(b"ac"),
+            tokenizer.encode_with_policy(b"ac", 2, 0).map(|(tokens, _)| tokens),
         ] {
             assert_eq!(result, Err(EncodeError { byte_offset: 1, byte: b'c' }));
         }
-        for result in [tokenizer.decode_bytes(&[3]), tokenizer.decode_bytes_checked(&[3])] {
-            assert!(matches!(result, Err(DecodeError::MissingToken { token_index: 0, token_id: 3 })));
-        }
+        assert!(matches!(tokenizer.decode_bytes(&[3]), Err(DecodeError::MissingToken { token_index: 0, token_id: 3 })));
         assert!(matches!(tokenizer.decode_utf8(&[3]), Err(DecodeError::MissingToken { token_index: 0, token_id: 3 })));
-        assert!(matches!(tokenizer.decode_utf8_checked(&[3]), Err(DecodeError::MissingToken { token_index: 0, token_id: 3 })));
         assert!(matches!(tokenizer.decode_lossy(&[3]), Err(DecodeError::MissingToken { token_index: 0, token_id: 3 })));
     }
 
@@ -764,7 +929,7 @@ mod tests {
     fn grouped_pair_and_triple_candidates_match_bucket_oracle() {
         let mut text = String::new();
         for id in 1..=256u32 {
-            text.push_str(&format!("{id} {} 1\n", literal(&[(id - 1) as u8])));
+            text.push_str(&format!("{id} {} 1\n", literal(&[u8::try_from(id - 1).unwrap()])));
         }
         // The shorter pair has the higher ID, but the longer triple wins.
         // The second triple exercises a group
@@ -809,7 +974,7 @@ mod tests {
         let seed = b"The quick brown fox \xe4\xb8\xad\xe6\x96\x87\n";
         let mut input = Vec::with_capacity(PARALLEL_MIN_BYTES + seed.len());
         while input.len() < PARALLEL_MIN_BYTES { input.extend_from_slice(seed); }
-        let sequential = tokenizer.encode_sequential(&input).unwrap();
+        let sequential = tokenizer.encode_bytes(&input).unwrap();
         // Exercise matching jobs on one-worker hosts without changing the CPU gate.
         let before = cooperation_stats();
         let (parallel, workers) = tokenizer.encode_with_worker_limit(&input, 2, PARALLEL_MIN_BYTES, 2).unwrap();
@@ -846,17 +1011,15 @@ mod tests {
             let end=tokenizer.data.tok_off[id+1] as usize;
             if start==end {continue;}
             let token=&tokenizer.data.tok_blob[start..end];
-            assert_eq!(tokenizer.match_at(token,0),(id as u32,token.len() as u8),"token {id}");
+            assert_eq!(tokenizer.match_at(token,0),(u32::try_from(id).unwrap(),u8::try_from(token.len()).unwrap()),"token {id}");
             count+=1;
         }
         assert_eq!(count,65529);
-        let owned=std::mem::size_of::<RwkvTokenizer>() + std::mem::size_of::<TokenizerData>() + 2*std::mem::size_of::<usize>() + tokenizer.data.tok_blob.capacity() + tokenizer.data.tok_off.capacity()*4
-            + tokenizer.data.trie_roots.capacity()*8 + tokenizer.data.transitions.capacity()*8;
-        println!("transition_slots={} owned_bytes={}",tokenizer.data.transitions.len(),owned);
         use sha2::{Digest, Sha256};
         let mut layout = Sha256::new();
         for state in tokenizer.data.trie_roots.iter().chain(&tokenizer.data.transitions) { layout.update(state.to_le_bytes()); }
-        println!("layout_sha256={:x}", layout.finalize());
+        // Pinned: constructor changes must reproduce the exact packed layout.
+        assert_eq!(format!("{:x}", layout.finalize()), "780121d33451dae07f03456b1cedd32463352383e23b9ad0293298a96fdd2f24");
         let mut vocabulary=String::new();
         for (id,token) in [b"abx".as_slice(),b"cdy",b"efz",b"abxy",b"cdxy",b"efxy"].iter().enumerate() {
             vocabulary.push_str(&format!("{} {} {}\n",id+1,literal(token),token.len()));
@@ -871,6 +1034,49 @@ mod tests {
         }
     }
     #[test]
+    fn decode_run_matches_token_table_for_every_id() {
+        // About 65k tokens: many decode quanta, and the last blob entry reads padding.
+        let tokenizer = RwkvTokenizer::bundled().unwrap();
+        let data = &tokenizer.data;
+        let span = |id: usize| data.tok_off[id] as usize..data.tok_off[id + 1] as usize;
+        let ids: Vec<u32> = (1..VOCAB_SIZE).filter(|&id| !span(id).is_empty()).map(|id| u32::try_from(id).unwrap()).collect();
+        let expected: Vec<u8> = (1..VOCAB_SIZE).flat_map(|id| data.tok_blob[span(id)].iter().copied()).collect();
+        assert_eq!(tokenizer.decode_bytes(&ids).unwrap(), expected);
+    }
+    pub(super) static BATCH_ENCODED: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn batch_stops_after_the_first_failing_document() {
+        let tokenizer = RwkvTokenizer::from_vocab_str_partial("1 b'a' 1
+").unwrap();
+        let big = "a".repeat(1 << 18);
+        let mut documents = vec!["a", "ab", "b"];
+        documents.extend(std::iter::repeat(big.as_str()).take(200));
+        let before = BATCH_ENCODED.load(Ordering::Relaxed);
+        let error = tokenizer.encode_batch_with_worker_limit(&documents, 2, 2).unwrap_err();
+        assert_eq!(error, BatchEncodeError { document_index: 1, source: EncodeError { byte_offset: 1, byte: b'b' } });
+        // Positive control: without the abort all 203 documents are encoded. Other
+        // batch tests share the counter, hence the generous bound.
+        assert!(BATCH_ENCODED.load(Ordering::Relaxed) - before < 100);
+        let ok = vec![big.as_str(); 8];
+        assert_eq!(tokenizer.encode_batch_with_worker_limit(&ok, 2, 2).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn parser_rejects_signs_and_non_hex_escapes() {
+        for (vocab, message) in [
+            ("+1 b'a' 1\n", "bad token ID at line 1"),
+            ("1 b'a' +1\n", "bad token length at line 1"),
+            ("1 b'\\x+a' 1\n", "bad literal at line 1"),
+            ("1 '\\u+041' 1\n", "bad literal at line 1"),
+        ] {
+            let error = RwkvTokenizer::from_vocab_str_partial(vocab).unwrap_err().to_string();
+            assert!(error.starts_with(message), "{vocab:?}: {error}");
+        }
+        assert_eq!(parse_python_literal("b'\\x0a'"), Some(vec![b'\n']));
+        assert_eq!(parse_python_literal("'\\u00e9'"), Some("\u{e9}".as_bytes().to_vec()));
+    }
+    #[test]
     fn explicit_policies_preserve_empty_input_and_greedy_error_offsets() {
         // There is no singleton for b: only actual token starts may raise errors.
         let tokenizer = RwkvTokenizer::from_vocab_str_partial("1 b'a' 1\n2 b'ab' 2\n").unwrap();
@@ -878,9 +1084,10 @@ mod tests {
         let mut invalid = valid.clone(); invalid.push(b'c');
         for workers in [0,1,2,4,8,16,usize::MAX] {
             for threshold in [0,16384,131072,usize::MAX] {
-                assert_eq!(tokenizer.encode_with_policy(b"",workers,threshold),Ok(vec![]));
-                assert_eq!(tokenizer.encode_with_policy(&valid,workers,threshold),tokenizer.encode_sequential(&valid));
-                assert_eq!(tokenizer.encode_with_policy(&invalid,workers,threshold),
+                let tokens = |input: &[u8]| tokenizer.encode_with_policy(input,workers,threshold).map(|(tokens, _)| tokens);
+                assert_eq!(tokens(b""),Ok(vec![]));
+                assert_eq!(tokens(&valid),tokenizer.encode_bytes(&valid));
+                assert_eq!(tokens(&invalid),
                     Err(EncodeError { byte_offset: valid.len(), byte: b'c' }));
             }
         }
@@ -929,15 +1136,16 @@ mod tests {
         let large = "hello world ".repeat(32768);
         let before = cooperation_stats();
         let expected = tokenizer.encode(&large).unwrap();
-        assert_eq!(tokenizer.encode_with_policy(large.as_bytes(), 8, 0).unwrap(), expected);
+        assert_eq!(tokenizer.encode_with_policy(large.as_bytes(), 8, 0).unwrap().0, expected);
         for count in [1,2,6,32] {
             assert_eq!(tokenizer.encode_batch_auto(&vec![large.as_str(); count]).unwrap(), vec![expected.clone(); count]);
         }
         let after = cooperation_stats();
         assert!(after.completed_quanta > before.completed_quanta);
         assert!(after.yields > before.yields);
-        assert!(after.peak_active <= PARALLEL_MAX_WORKERS);
-        assert!(after.pool_threads <= PARALLEL_MAX_WORKERS);
+        // The CPU-budget cap never exceeds 8 workers.
+        assert!(after.peak_active <= 8);
+        assert!(after.pool_threads <= 8);
         if after.worker_limit > 1 { assert!(after.submitted_jobs > before.submitted_jobs); }
     }
 
@@ -946,28 +1154,123 @@ mod tests {
         for count in [15u32,16,256] {
             for shorter_has_higher_id in [false,true] {
                 let mut vocab=String::new();
-                for byte in 0..256u32 { vocab.push_str(&format!("{} {} 1\n",byte+1,literal(&[byte as u8]))); }
+                for byte in 0..256u32 { vocab.push_str(&format!("{} {} 1\n",byte+1,literal(&[u8::try_from(byte).unwrap()]))); }
                 if !shorter_has_higher_id { vocab.push_str("299 b'ab' 2\n"); }
                 let mut partial=String::new();
                 if !shorter_has_higher_id { partial.push_str("299 b'ab' 2\n"); }
                 for byte in 0..count {
-                    let line=format!("{} {} 3\n",300+byte,literal(&[b'a',b'b',byte as u8]));
+                    let line=format!("{} {} 3\n",300+byte,literal(&[b'a',b'b',u8::try_from(byte).unwrap()]));
                     vocab.push_str(&line);partial.push_str(&line);
                 }
                 if shorter_has_higher_id { vocab.push_str("600 b'ab' 2\n");partial.push_str("600 b'ab' 2\n"); }
                 let full=RwkvTokenizer::from_vocab_str(&vocab).unwrap();
                 let partial=RwkvTokenizer::from_vocab_str_partial(&partial).unwrap();
                 for byte in 0..count {
-                    let input=[b'a',b'b',byte as u8];
-                    assert_eq!(full.encode_sequential(&input).unwrap(),vec![300+byte]);
-                    assert_eq!(partial.encode_sequential(&input),Ok(vec![300+byte]));
+                    let input=[b'a',b'b',u8::try_from(byte).unwrap()];
+                    assert_eq!(full.encode_bytes(&input).unwrap(),vec![300+byte]);
+                    assert_eq!(partial.encode_bytes(&input),Ok(vec![300+byte]));
                 }
                 if count<256 {
                     let input=[b'a',b'b',255];
-                    assert_eq!(partial.encode_sequential(&input),Err(EncodeError { byte_offset:2,byte:255 }));
+                    assert_eq!(partial.encode_bytes(&input),Err(EncodeError { byte_offset:2,byte:255 }));
                 }
             }
         }
     }
 
+    #[test]
+    fn from_file_loads_a_vocabulary_and_reports_a_missing_file() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("rwkv_tokenizer_test_{}_{nanos}.txt", std::process::id()));
+        std::fs::write(&path, include_str!("../vocab/rwkv_vocab_v20230424.txt")).unwrap();
+        let loaded = RwkvTokenizer::from_file(&path);
+        std::fs::remove_file(&path).unwrap();
+        let bundled = RwkvTokenizer::bundled().unwrap();
+        assert_eq!(loaded.unwrap().encode("Hello 世界").unwrap(), bundled.encode("Hello 世界").unwrap());
+        let error = RwkvTokenizer::from_file(&path).unwrap_err().to_string();
+        assert!(error.contains("rwkv_tokenizer_test_"), "{error}");
+    }
+
+    #[test]
+    fn decode_utf8_and_lossy_handle_invalid_utf8() {
+        let tokenizer = RwkvTokenizer::bundled().unwrap();
+        let lone = tokenizer.encode_bytes(&[0x80]).unwrap();
+        assert!(matches!(tokenizer.decode_utf8(&lone), Err(DecodeError::InvalidUtf8(_))));
+        assert_eq!(tokenizer.decode_lossy(&lone).unwrap(), "\u{fffd}");
+        let mut mixed = tokenizer.encode("ok ").unwrap();
+        mixed.extend(&lone);
+        assert_eq!(tokenizer.decode_lossy(&mixed).unwrap(), "ok \u{fffd}");
+        let valid = tokenizer.encode("Hello, 世界! 🦀").unwrap();
+        assert_eq!(tokenizer.decode_lossy(&valid).unwrap(), "Hello, 世界! 🦀");
+    }
+
+    #[test]
+    fn decode_reports_out_of_range_ids_with_their_index() {
+        let tokenizer = RwkvTokenizer::bundled().unwrap();
+        let good = tokenizer.encode("a").unwrap()[0];
+        for bad in [65_536u32, u32::MAX] {
+            assert!(matches!(tokenizer.decode_bytes(&[good, good, bad]), Err(DecodeError::MissingToken { token_index: 2, token_id }) if token_id == bad));
+            assert!(matches!(tokenizer.decode_utf8(&[bad]), Err(DecodeError::MissingToken { token_index: 0, token_id }) if token_id == bad));
+        }
+    }
+
+    #[test]
+    fn error_display_and_source() {
+        use std::error::Error;
+        let encode = EncodeError { byte_offset: 7, byte: 0x63 };
+        assert_eq!(encode.to_string(), "no token for byte 0x63 at byte offset 7");
+        let batch = BatchEncodeError { document_index: 2, source: encode.clone() };
+        assert_eq!(batch.to_string(), "document 2: no token for byte 0x63 at byte offset 7");
+        assert_eq!(batch.source().unwrap().to_string(), encode.to_string());
+        assert!(encode.source().is_none());
+        let missing = DecodeError::MissingToken { token_index: 4, token_id: 99 };
+        assert_eq!(missing.to_string(), "missing token ID 99 at token index 4");
+        let utf8 = String::from_utf8(vec![0xff]).unwrap_err();
+        let text = DecodeError::InvalidUtf8(utf8).to_string();
+        assert!(text.starts_with("decoded bytes are not UTF-8: "), "{text}");
+    }
+
+    #[test]
+    fn vocab_and_decode_error_traits() {
+        use std::error::Error;
+        let io = RwkvTokenizer::from_file(Path::new("definitely/missing/vocab.txt")).unwrap_err();
+        assert!(matches!(io, VocabError::Io { .. }));
+        assert!(io.source().is_some());
+        let invalid = RwkvTokenizer::from_vocab_str("").unwrap_err();
+        assert_eq!(invalid.to_string(), "vocabulary is empty");
+        assert!(invalid.source().is_none());
+        let tokenizer = RwkvTokenizer::bundled().unwrap();
+        let utf8 = tokenizer.decode_utf8(&tokenizer.encode_bytes(&[0x80]).unwrap()).unwrap_err();
+        assert!(utf8.source().is_some());
+        assert_eq!(utf8.clone(), utf8);
+        assert!(DecodeError::MissingToken { token_index: 0, token_id: 0 }.source().is_none());
+    }
+
+    #[test]
+    fn batch_auto_small_batch_preserves_order_and_matches_encode() {
+        let tokenizer = RwkvTokenizer::bundled().unwrap();
+        let documents = ["", "Hello", "世界", "🦀 crab", "Hello"];
+        let batch = tokenizer.encode_batch_auto(&documents).unwrap();
+        let expected: Vec<Vec<u32>> = documents.iter().map(|text| tokenizer.encode(text).unwrap()).collect();
+        assert_eq!(batch, expected);
+    }
+
+    #[test]
+    fn vocabulary_errors_blank_separator_singletons_empty_and_crlf() {
+        for (text, expected) in [
+            ("1 b'a' 1\n\n2 b'b' 1\n", "malformed vocabulary line 2: blank line"),
+            ("1b'a'1\n", "malformed vocabulary line 1: missing separator"),
+            ("", "vocabulary is empty"),
+        ] {
+            let error = RwkvTokenizer::from_vocab_str_partial(text).unwrap_err().to_string();
+            assert!(error.contains(expected), "{text:?}: {error}");
+        }
+        let error = RwkvTokenizer::from_vocab_str("1 b'a' 1\n").unwrap_err().to_string();
+        assert!(error.contains("missing singleton byte 0x00"), "{error}");
+        let lf = "1 b'a' 1\n2 b'b' 1\n3 b'ab' 2\n";
+        let crlf = lf.replace('\n', "\r\n");
+        let (lf, crlf) = (RwkvTokenizer::from_vocab_str_partial(lf).unwrap(), RwkvTokenizer::from_vocab_str_partial(&crlf).unwrap());
+        assert_eq!(lf.encode("abba").unwrap(), crlf.encode("abba").unwrap());
+        assert_eq!(crlf.encode("abba").unwrap(), vec![3, 2, 1]);
+    }
 }

@@ -1,4 +1,4 @@
-#![warn(clippy::undocumented_unsafe_blocks)]
+//! Benchmark and verification driver over a JSON fixture (see benchmark/README.md).
 
 use rwkv_tokenizer::{DecodeError, EncodeError, RwkvTokenizer, PARALLEL_MIN_BYTES};
 use serde_json::{json, Value};
@@ -285,14 +285,14 @@ fn encode_case(
     let input = case.text.as_bytes();
     match mode {
         Mode::Sequential => tokenizer
-            .encode_sequential(input)
+            .encode_bytes(input)
             .map(|tokens| (tokens, "sequential", 1))
             .map_err(|error: EncodeError| {
                 format!("case_id {:?} encode failed: {error}", case.case_id)
             }),
         Mode::Parallel => {
             tokenizer
-                .encode_with_policy_report(input, workers, PARALLEL_MIN_BYTES)
+                .encode_with_policy(input, workers, PARALLEL_MIN_BYTES)
                 .map(|(tokens, workers)| {
                     if workers == 1 {
                         (tokens, "sequential-fallback", 1)

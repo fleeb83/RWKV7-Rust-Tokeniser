@@ -5,6 +5,8 @@ fixed 76-row corpus. It does not contain the expanded fixture, vocabulary, or
 model files. The corpus is deterministic input data with SHA-256
 `3daea831cef996f46ca9db69ee8b6686d8c24c48cd0c6103b8b842c1dc9d43b6`.
 
+The latest measurements are in [PR5-PERFORMANCE.md](PR5-PERFORMANCE.md).
+
 ## Prepare pinned inputs
 
 The reference source is pinned to a public commit. Use the bundled vocabulary
