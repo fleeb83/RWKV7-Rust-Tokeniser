@@ -9,5 +9,6 @@ The vocabulary is redistributed unmodified under Apache-2.0.
 Upstream license: https://github.com/BlinkDL/ChatRWKV/blob/2e2bb1cd390cefbedae0a89f4a343f6f754d6621/LICENSE
 A copy of the Apache-2.0 license is included in LICENSE.
 
-Packaging changes on 2026-09-05 add a bundled-vocabulary constructor and test;
-the matching algorithm is unchanged.
+Packaging changes on 2026-09-05 added a bundled-vocabulary constructor and test.
+Later releases changed the tokenizer implementation; the bundled vocabulary
+file itself remains unmodified.
