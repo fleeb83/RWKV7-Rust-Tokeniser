@@ -98,7 +98,7 @@ returns an error.
 
 ## Handling decoding errors
 
-The checked APIs return errors for unknown token IDs. Token ID `0` is reserved
+The decode APIs return a `DecodeError` for unknown token IDs. Token ID `0` is reserved
 and has no text entry; handle it as end-of-text in your generation loop before
 decoding:
 
@@ -124,6 +124,9 @@ Use this tokenizer with models trained on the RWKV World vocabulary
 For a vocabulary file of your own, use
 `RwkvTokenizer::from_file(std::path::Path::new("path/to/vocab.txt"))`.
 It must follow the supported RWKV World format and token ordering.
+Loading returns a `VocabError`: `Io` for an unreadable file, `Invalid` for a
+malformed vocabulary. It implements `std::error::Error`, so `?` works with
+`Box<dyn Error>`.
 
 ## Longest-match selection
 
@@ -143,7 +146,10 @@ Version **0.2.0** adds a cooperative CPU budget shared by independent tokenizer
 instances in the same process. The active-worker limit is
 `(available_logical_cpus / 32).clamp(1, 8)`, refreshed once per second. On the
 32-thread laptop used for testing, that means one active worker. Work quanta
-adapt toward 1 ms, with byte budgets between 16 and 256 KiB.
+adapt toward 1 ms, with byte budgets between 16 and 256 KiB. Encodes of 256
+bytes or less and decodes of 64 tokens or fewer take the budget on a thread's
+first call and every 16th call after it; skipped calls are credited to
+`completed_quanta` when the next sampled call finishes.
 
 Waiting callers and single-CPU hosts trigger rest periods. The library does
 not change process priority or affinity. You can inspect its counters through
@@ -159,7 +165,9 @@ validation use the same gate but are not internally interruptible.
 These measurements help show where the implementation works well and where
 there is room to improve. They are from one Windows i9-14900HX laptop and a
 70-case holdout of English text and code from the Canterbury corpus.
-Your workload and machine may behave differently.
+Your workload and machine may behave differently. These are the 0.2.0
+numbers; the latest measurements, for the 0.3.0 performance work in PR #5,
+are in [benchmark/PR5-PERFORMANCE.md](benchmark/PR5-PERFORMANCE.md).
 
 ![Horizontal bar chart of measured speed relative to Cahya: single encoding 1.302x, whole documents 1.619x, 8 KiB chunks 1.652x, short lines 0.826x, batches 2.163x, UTF-8 decoding 3.762x, and vocabulary loading 0.921x. The reference line is 1.0x.](benchmark/v0.2.0-performance.png)
 
@@ -174,6 +182,27 @@ calls and some large inputs in the separate training screen were also slower.
 See the [benchmark summary](benchmark/V0.2.0.md) for exact numbers, methodology,
 correctness checks and limitations. Earlier Python comparisons are preserved
 in [historical results](benchmark/HISTORICAL.md).
+
+## Upgrading to 0.3.0
+
+0.3.0 contains the performance work from PR #5 (faster vocabulary loading,
+cheaper tiny calls, a tighter encode loop, a faster decode copy and batch
+early abort) plus an API cleanup. The cleanup is semver-breaking:
+
+- `bundled`, `from_file`, `from_vocab_str` and `from_vocab_str_partial` return
+  `Result<_, VocabError>` instead of `Result<_, String>`; use
+  `.to_string()` where you need the message.
+- Removed duplicates: `encode_checked` and `encode_bytes_checked` (use
+  `encode` / `encode_bytes`), `decode_bytes_checked` and `decode_utf8_checked`
+  (use `decode_bytes` / `decode_utf8`), `encode_sequential` (use
+  `encode_bytes`), `encode_parallel_with_workers` (use `encode_with_policy`).
+- `encode_with_policy` now returns `(tokens, job_count)`; this replaces
+  `encode_with_policy_report`.
+- Removed `parse_python_literal_pub`, `PARALLEL_MAX_WORKERS`,
+  `BATCH_MIN_BYTES` and `BATCH_BYTES_PER_WORKER`.
+- `EncodeError`, `BatchEncodeError`, `DecodeError`, `VocabError` and
+  `CooperationStats` are `#[non_exhaustive]`; `DecodeError` also derives
+  `Clone`, `PartialEq` and `Eq`, and reports its `source()`.
 
 ## Contributions
 

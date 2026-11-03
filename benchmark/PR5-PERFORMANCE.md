@@ -1,0 +1,157 @@
+# PR #5 performance summary
+
+Measured on Windows with an Intel Core i9-14900HX (32 logical CPUs, so the
+active-worker cap is one), 2026-11-02. `main` is 0.2.1 (`5c31475`). The PR
+was measured in two rounds:
+
+- **Round 1** (`fc14802`/`cd321cb`): faster loading, cheaper tiny calls, and a
+  tighter encode loop.
+- **Round 2** (`562c4bf`): a flat construction trie, a fixed-size decode copy,
+  batch early abort, and parser strictness.
+
+Each run used the local autoresearch harness: seven rotating trials of at
+least 0.5 seconds at BelowNormal priority, with Cahya
+(`63b21e891d0c8efd95997d797049bb7f92098d8c`) in the same executable. Runs
+alternated between the two sides. Every run passed its audit: complete token
+IDs, timing arithmetic, and source, harness, binary and dependency hashes.
+Each binary's embedded source hash was checked against the intended source.
+
+Values are same-run ratios against Cahya; a value above one favours this
+crate.
+
+PR #5 was squashed into one commit before merge. The short commit hashes
+below refer to its development history. The measured 0.3.0 source is
+identical to the release: `src/lib.rs` SHA-256
+`11438d54f0cd80f69915d3f22e16567a51775cb5b0875c95467e9ebb7e4121e3`.
+
+## Final: 0.3.0 versus `main` (harness v4)
+
+This is the release comparison. It covers the final head (`5102aff`, version
+0.3.0) against `main`, measured in one session on 2026-11-03 after a reboot.
+
+- **Harness v4:** calls `encode_bytes`, which both APIs share and which runs
+  the same function as `encode_sequential`.
+- **P-core pinning:** the benchmark process is pinned to the P-core threads,
+  logical CPUs 0–15. A pinned spin loop identified them: about 455 ms on
+  P-cores versus 605–709 ms on E-cores.
+- **Clock check:** Windows-reported processor performance was 177–228% after
+  every run, so nothing ran at reduced clock.
+
+| Workload | `main` | 0.3.0 |
+|---|---:|---:|
+| Screen geometric mean | 1.042–1.059x (3 runs) | **1.097–1.117x** (2 runs) |
+| Screen short | 1.255–1.327x | 1.445–1.455x |
+| Screen 16 KiB | 1.184–1.237x | 1.290–1.306x |
+| Screen 1 MiB | 0.868–0.897x | 0.926–0.960x |
+| Holdout single encoding, aggregate | 1.383x | **1.535x** |
+| Holdout short lines | 0.785x | **1.158x** |
+| Holdout UTF-8 decoding, whole documents | 4.897x | **18.657x** |
+| Holdout UTF-8 decoding, short lines | 2.535x | 6.916x |
+| Holdout batches, aggregate | 2.013x | 2.362x |
+| Vocabulary construction | 0.952x (152.2 ms) | **5.886x** (27.1 ms) |
+| Micro 1–32 bytes (2 runs each) | 0.516–0.520x | **1.124–1.157x** |
+| Micro 33–128 bytes | 0.937–0.973x | 1.464–1.470x |
+| Micro 129–256 bytes | 1.050–1.096x | 1.535–1.537x |
+| Micro construct and drop | 0.991–1.006x | 5.670–5.827x |
+| Foreground contention guard | pass | pass |
+
+Contention service median, idle to loaded, was 185.5 → 187.7 µs on `main` and
+228.1 → 226.1 µs on 0.3.0. The p95 was 279.0 → 269.7 µs and 331.5 → 356.1 µs,
+and wake p95 was 688.8 → 727.6 µs and 992.9 → 1087.4 µs, all inside the
+guard's limits.
+
+**Excluded run.** One 0.3.0 screen run (`032-v030-v4n-screen-a`) was disturbed
+mid-run and replaced by a third pair. Its "prior" column, the same 07-hybrid
+code in every run and so a host-stability control, fell to 67–187 MiB/s
+against 141–269 MiB/s in every other run. Its group ratios swung from 0.761x
+to 1.940x. It passed its audit and is retained under `results/`, but it is not
+used above.
+
+**Earlier throttled attempt.** A first attempt the same morning ran with the
+CPU clamped near minimum clock by the laptop's embedded controller. Windows
+reported 26% processor performance, about 576 MHz, and a reboot cleared it. Its
+same-run ratios matched these: screen 1.038–1.044x versus 1.090–1.104x,
+construction 0.821x versus 4.828x, and 1–32 bytes 0.491–0.515x versus
+1.118–1.125x. Absolute numbers from that attempt are 8–10x low and should not
+be quoted.
+
+## Two host regimes
+
+This hybrid CPU ran some trials at about twice the absolute throughput of
+others, probably because of P-core versus E-core placement at BelowNormal
+priority. The ratio against Cahya on large inputs depends on the regime, so
+the screen results are grouped by it. "Fast" runs had about 350 MiB/s or more
+at 1 MiB; "slow" runs had about 190 MiB/s. Only compare runs within the same
+regime.
+
+## Screen (94 training cases, single caller, harness v3)
+
+| Run | Regime | Geometric mean | 16 KiB | 1 MiB |
+|---|---|---:|---:|---:|
+| `main` v3b | fast | 1.079x | 1.263x | 0.921x |
+| PR round 1 (`cd321cb`) | fast | 1.136x | 1.312x | 0.966x |
+| PR round 2 (`562c4bf`) | fast | 1.172x | 1.390x | 0.983x |
+| `main` v3a | slow | 1.151x | 1.217x | 1.089x |
+| PR round 1, two runs | slow | 1.257–1.271x | 1.387–1.421x | 1.113–1.146x |
+
+Within a regime, the PR raises the screen mean by about 5–10%. On fast cores,
+1 MiB inputs remain slightly behind Cahya. Round 2 did not change the encode
+path, so its difference from round 1 is noise.
+
+## Public holdout (70 Canterbury cases, equal one-worker budget)
+
+| Operation | `main` (2 runs) | PR round 1 (2 runs) | PR round 2 |
+|---|---:|---:|---:|
+| Single encoding, aggregate | 1.262–1.370x | 1.580–1.637x | 1.532x |
+| Short lines | 0.834–0.931x | 1.223–1.458x | 1.239x |
+| UTF-8 decoding, whole documents | 4.217–5.652x | 3.762–3.832x | **18.552x** |
+| UTF-8 decoding, short lines | 2.211–2.592x | 4.694–6.724x | 6.479x |
+| Vocabulary construction | 0.955–1.016x | 3.520–3.751x | **5.179x** (26.9 ms) |
+
+Round 2's decode change copies tokens of eight bytes or fewer as one
+fixed-size block. Whole-document decoding went from 394 to 1,864 MiB/s in
+paired runs, while short-line decoding was unchanged. Construction went from
+41.1 to 26.9 ms. Batch aggregates (1.865–3.070x on `main`, 2.188–2.276x on
+the PR) overlap and are too noisy to rank.
+
+## Micro (training strings of 256 bytes or less, and construction)
+
+| Group | `main` (4 runs) | PR round 1 (4 runs) | PR round 2 |
+|---|---:|---:|---:|
+| 1–32 bytes | 0.477–0.574x | 1.022–1.154x | 1.210x |
+| 33–128 bytes | 0.970–1.176x | 1.542–1.662x | 1.531x |
+| 129–256 bytes | 1.104–1.383x | 1.435–1.820x | 1.745x |
+| Construct and drop | 0.957–1.175x | 3.558–4.039x | 5.888x |
+
+The PR round 1 range for 33–128 bytes excludes one 0.757x outlier, which two
+repeat runs did not reproduce.
+
+## Responsiveness
+
+The foreground contention guard (`run_contention.ps1`: 10-second idle, loaded
+and idle phases at Normal priority) passed in every run:
+
+| Run | Service median, idle → loaded | p95, idle → loaded | Wake p95, idle → loaded |
+|---|---|---|---|
+| `main` | 213.0 → 218.2 µs | 340.4 → 329.6 µs | 889.2 → 764.3 µs |
+| PR round 1 | 250.1 → 253.2 µs | 445.7 → 388.6 µs | 1193.3 → 1050.0 µs |
+| PR round 2 | 227.1 → 230.2 µs | 356.2 → 375.8 µs | 945.4 → 858.1 µs |
+
+The guard compares each run's loaded phase with its own idle phase. Absolute
+idle levels are not comparable across rows.
+
+Encodes of 256 bytes or less, and decodes of 64 tokens or fewer, take the
+shared gate on one call in 16 per thread. The skipped calls are not charged
+as busy time. This trade-off is marked in `src/cooperate.rs` for revisiting
+if a foreground guard regresses.
+
+## Harness note
+
+The screen's custom-vocabulary parity check (harness version 3) compares
+against an independent brute-force longest-match oracle instead of the old
+baseline crate. That crate encoded the pre-0.2.1 "higher ID wins" rule and
+rejected `main` as well. As a positive control, the old rule disagrees with
+the oracle on 91 of the 11,718 cases, and the harness fails if that count is
+zero. Harness version 4 adds the API change and the optional CPU affinity
+mask (recorded in each run's host record) described in the final section. The
+autoresearch harness is local and not part of this repository.
