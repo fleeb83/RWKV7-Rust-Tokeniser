@@ -33,8 +33,8 @@ cargo run --example usage --locked
 cargo test --locked
 ```
 
-On Windows, Rust's MSVC toolchain needs Visual Studio C++ Build Tools and a
-Windows SDK. Python is only needed for optional
+The crate needs Rust 1.81 or newer. On Windows, Rust's MSVC toolchain needs
+Visual Studio C++ Build Tools and a Windows SDK. Python is only needed for optional
 [reference checks and benchmarks](benchmark/README.md).
 
 ## Text to tokens and back
@@ -94,7 +94,7 @@ assert_eq!(tokenizer.decode_bytes(&ids).unwrap(), bytes);
 This is also useful during streaming generation: one token can contain only
 part of a UTF-8 character. Accumulate decoded bytes until you have complete
 UTF-8 before displaying text. Calling `decode_utf8` on an incomplete character
-returns an error.
+returns an error; `decode_lossy` instead replaces invalid UTF-8 with U+FFFD.
 
 ## Handling decoding errors
 
@@ -164,12 +164,10 @@ validation use the same gate but are not internally interruptible.
 
 These measurements help show where the implementation works well and where
 there is room to improve. They are from one Windows i9-14900HX laptop and a
-70-case holdout of English text and code from the Canterbury corpus.
-Your workload and machine may behave differently. These are the 0.2.0
-numbers; the latest measurements, for the 0.3.0 performance work in PR #5,
-are in [benchmark/PR5-PERFORMANCE.md](benchmark/PR5-PERFORMANCE.md).
+70-case holdout of English text and code from the Canterbury corpus, measured
+for version 0.3.0. Your workload and machine may behave differently.
 
-![Horizontal bar chart of measured speed relative to Cahya: single encoding 1.302x, whole documents 1.619x, 8 KiB chunks 1.652x, short lines 0.826x, batches 2.163x, UTF-8 decoding 3.762x, and vocabulary loading 0.921x. The reference line is 1.0x.](benchmark/v0.2.0-performance.png)
+![Horizontal bar chart of measured speed relative to Cahya for version 0.3.0: single encoding 1.535x, whole documents 1.810x, 8 KiB chunks 1.728x, short lines 1.158x, batches 2.362x, UTF-8 decoding 13.372x, and vocabulary loading 5.886x. The reference line is 1.0x.](benchmark/v0.3.0-performance.png)
 
 Cahya is the 1.0x reference: a value above one means less time for the same
 work in this test. Batch comparisons use the same one-worker CPU budget for
@@ -177,11 +175,13 @@ both implementations, not unrestricted Rayon. Aggregate bars are geometric
 means of group medians; the document, chunk and line bars break down the
 single-encoding result.
 
-Short lines and vocabulary loading were slower in this holdout. Very small
-calls and some large inputs in the separate training screen were also slower.
-See the [benchmark summary](benchmark/V0.2.0.md) for exact numbers, methodology,
-correctness checks and limitations. Earlier Python comparisons are preserved
-in [historical results](benchmark/HISTORICAL.md).
+Every holdout group is now faster than Cahya, including short lines and
+vocabulary loading, which were slower in 0.2.0. In the separate training
+screen, the largest inputs remain slightly slower: 1 MiB documents measured
+0.93–0.96x. See the [0.3.0 benchmark summary](benchmark/V0.3.0.md) for exact
+numbers, methodology, correctness checks and limitations. The
+[0.2.0 summary](benchmark/V0.2.0.md) and earlier Python comparisons in
+[historical results](benchmark/HISTORICAL.md) are kept for reference.
 
 ## Upgrading to 0.3.0
 
@@ -203,6 +203,10 @@ early abort) plus an API cleanup. The cleanup is semver-breaking:
 - `EncodeError`, `BatchEncodeError`, `DecodeError`, `VocabError` and
   `CooperationStats` are `#[non_exhaustive]`; `DecodeError` also derives
   `Clone`, `PartialEq` and `Eq`, and reports its `source()`.
+- Vocabulary parsing is stricter, matching Python: token IDs and lengths must
+  be plain decimal digits, and `\x` / `\u` escapes must use hex digits. A file
+  that relied on a leading `+` or a malformed escape now fails to load.
+- The minimum supported Rust version is 1.81.
 
 ## Contributions
 
